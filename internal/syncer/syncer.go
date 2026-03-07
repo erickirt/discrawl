@@ -102,9 +102,81 @@ func (s *Syncer) syncGuild(ctx context.Context, guildID string, opts SyncOptions
 	}); err != nil {
 		return SyncStats{}, err
 	}
+	stats := SyncStats{}
+	channelList, targeted, err := s.channelList(ctx, guildID, opts.ChannelIDs)
+	if err != nil {
+		return stats, err
+	}
+	for _, channel := range channelList {
+		raw, _ := json.Marshal(channel)
+		record := toChannelRecord(channel, string(raw))
+		if err := s.store.UpsertChannel(ctx, record); err != nil {
+			return stats, err
+		}
+		stats.Channels++
+		if strings.HasPrefix(record.Kind, "thread_") {
+			stats.Threads++
+		}
+	}
+	if !targeted {
+		members, err := s.client.GuildMembers(ctx, guildID)
+		if err == nil {
+			converted := make([]store.MemberRecord, 0, len(members))
+			for _, member := range members {
+				raw, _ := json.Marshal(member)
+				roles, _ := json.Marshal(member.Roles)
+				converted = append(converted, store.MemberRecord{
+					GuildID:       guildID,
+					UserID:        member.User.ID,
+					Username:      member.User.Username,
+					GlobalName:    member.User.GlobalName,
+					DisplayName:   displayName(member),
+					Nick:          member.Nick,
+					Discriminator: member.User.Discriminator,
+					Avatar:        member.Avatar,
+					Bot:           member.User.Bot,
+					JoinedAt:      member.JoinedAt.Format(time.RFC3339Nano),
+					RoleIDsJSON:   string(roles),
+					RawJSON:       string(raw),
+				})
+			}
+			if err := s.store.ReplaceMembers(ctx, guildID, converted); err != nil {
+				return stats, err
+			}
+			stats.Members = len(converted)
+		} else {
+			s.logger.Warn("member crawl failed", "guild_id", guildID, "err", err)
+		}
+	}
+	for _, channel := range channelList {
+		if !isMessageChannel(channel) {
+			continue
+		}
+		if len(opts.ChannelIDs) > 0 && !slices.Contains(opts.ChannelIDs, channel.ID) {
+			continue
+		}
+	}
+	messageCount, err := s.syncMessageChannels(ctx, guildID, channelList, opts)
+	if err != nil {
+		return stats, err
+	}
+	stats.Messages += messageCount
+	return stats, nil
+}
+
+func (s *Syncer) channelList(ctx context.Context, guildID string, requested []string) ([]*discordgo.Channel, bool, error) {
+	if len(requested) > 0 && s.store != nil {
+		rows, err := s.store.Channels(ctx, guildID)
+		if err != nil {
+			return nil, false, err
+		}
+		if selected := selectStoredChannels(rows, requested); len(selected) > 0 {
+			return selected, true, nil
+		}
+	}
 	channels, err := s.client.GuildChannels(ctx, guildID)
 	if err != nil {
-		return SyncStats{}, fmt.Errorf("fetch channels for guild %s: %w", guildID, err)
+		return nil, false, fmt.Errorf("fetch channels for guild %s: %w", guildID, err)
 	}
 	allChannels := make(map[string]*discordgo.Channel, len(channels))
 	for _, channel := range channels {
@@ -131,61 +203,7 @@ func (s *Syncer) syncGuild(ctx context.Context, guildID string, opts SyncOptions
 			}
 		}
 	}
-	channelList := mapsToSlice(allChannels)
-	stats := SyncStats{}
-	for _, channel := range channelList {
-		raw, _ := json.Marshal(channel)
-		record := toChannelRecord(channel, string(raw))
-		if err := s.store.UpsertChannel(ctx, record); err != nil {
-			return stats, err
-		}
-		stats.Channels++
-		if strings.HasPrefix(record.Kind, "thread_") {
-			stats.Threads++
-		}
-	}
-	members, err := s.client.GuildMembers(ctx, guildID)
-	if err == nil {
-		converted := make([]store.MemberRecord, 0, len(members))
-		for _, member := range members {
-			raw, _ := json.Marshal(member)
-			roles, _ := json.Marshal(member.Roles)
-			converted = append(converted, store.MemberRecord{
-				GuildID:       guildID,
-				UserID:        member.User.ID,
-				Username:      member.User.Username,
-				GlobalName:    member.User.GlobalName,
-				DisplayName:   displayName(member),
-				Nick:          member.Nick,
-				Discriminator: member.User.Discriminator,
-				Avatar:        member.Avatar,
-				Bot:           member.User.Bot,
-				JoinedAt:      member.JoinedAt.Format(time.RFC3339Nano),
-				RoleIDsJSON:   string(roles),
-				RawJSON:       string(raw),
-			})
-		}
-		if err := s.store.ReplaceMembers(ctx, guildID, converted); err != nil {
-			return stats, err
-		}
-		stats.Members = len(converted)
-	} else {
-		s.logger.Warn("member crawl failed", "guild_id", guildID, "err", err)
-	}
-	for _, channel := range channelList {
-		if !isMessageChannel(channel) {
-			continue
-		}
-		if len(opts.ChannelIDs) > 0 && !slices.Contains(opts.ChannelIDs, channel.ID) {
-			continue
-		}
-	}
-	messageCount, err := s.syncMessageChannels(ctx, guildID, channelList, opts)
-	if err != nil {
-		return stats, err
-	}
-	stats.Messages += messageCount
-	return stats, nil
+	return mapsToSlice(allChannels), false, nil
 }
 
 func (s *Syncer) syncMessageChannels(
@@ -216,6 +234,9 @@ func (s *Syncer) syncMessageChannels(
 		for _, channel := range messageChannels {
 			count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full)
 			if err != nil {
+				if s.skipUnavailableChannel(ctx, channel, err) {
+					continue
+				}
 				return total, fmt.Errorf("sync channel %s: %w", channel.ID, err)
 			}
 			total += count
@@ -244,6 +265,9 @@ func (s *Syncer) syncMessageChannels(
 					return
 				}
 				count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full)
+				if err != nil && s.skipUnavailableChannel(ctx, channel, err) {
+					err = nil
+				}
 				select {
 				case results <- result{channelID: channel.ID, count: count, err: err}:
 				case <-ctx.Done():
@@ -282,6 +306,17 @@ func (s *Syncer) syncMessageChannels(
 		}
 	}
 	return total, firstErr
+}
+
+func (s *Syncer) skipUnavailableChannel(ctx context.Context, channel *discordgo.Channel, err error) bool {
+	if !isMissingAccess(err) {
+		return false
+	}
+	s.logger.Warn("channel message crawl skipped", "channel_id", channel.ID, "err", err)
+	if s.store != nil {
+		_ = s.store.SetSyncState(ctx, "channel:"+channel.ID+":unavailable", "missing_access")
+	}
+	return true
 }
 
 func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channel *discordgo.Channel, full bool) (int, error) {
@@ -530,6 +565,54 @@ func mapsToSlice(in map[string]*discordgo.Channel) []*discordgo.Channel {
 	return out
 }
 
+func selectStoredChannels(rows []store.ChannelRow, requested []string) []*discordgo.Channel {
+	if len(rows) == 0 || len(requested) == 0 {
+		return nil
+	}
+	set := makeGuildSet(requested)
+	out := make([]*discordgo.Channel, 0, len(requested))
+	for _, row := range rows {
+		if _, ok := set[row.ID]; !ok {
+			continue
+		}
+		channelType := channelTypeFromKind(row.Kind)
+		var threadMeta *discordgo.ThreadMetadata
+		if strings.HasPrefix(row.Kind, "thread_") {
+			threadMeta = &discordgo.ThreadMetadata{
+				Archived:         row.IsArchived,
+				Locked:           row.IsLocked,
+				ArchiveTimestamp: row.ArchiveTimestamp,
+			}
+		}
+		out = append(out, &discordgo.Channel{
+			ID:             row.ID,
+			GuildID:        row.GuildID,
+			ParentID:       row.ParentID,
+			Name:           row.Name,
+			Topic:          row.Topic,
+			Position:       row.Position,
+			NSFW:           row.IsNSFW,
+			Type:           channelType,
+			ThreadMetadata: threadMeta,
+		})
+	}
+	slices.SortFunc(out, func(a, b *discordgo.Channel) int {
+		switch {
+		case a.Position < b.Position:
+			return -1
+		case a.Position > b.Position:
+			return 1
+		case a.ID < b.ID:
+			return -1
+		case a.ID > b.ID:
+			return 1
+		default:
+			return 0
+		}
+	})
+	return out
+}
+
 func isThreadParent(channel *discordgo.Channel) bool {
 	if channel == nil {
 		return false
@@ -695,6 +778,29 @@ func channelKind(channel *discordgo.Channel) string {
 	}
 }
 
+func channelTypeFromKind(kind string) discordgo.ChannelType {
+	switch kind {
+	case "category":
+		return discordgo.ChannelTypeGuildCategory
+	case "text":
+		return discordgo.ChannelTypeGuildText
+	case "announcement":
+		return discordgo.ChannelTypeGuildNews
+	case "forum":
+		return discordgo.ChannelTypeGuildForum
+	case "thread_public":
+		return discordgo.ChannelTypeGuildPublicThread
+	case "thread_private":
+		return discordgo.ChannelTypeGuildPrivateThread
+	case "thread_announcement":
+		return discordgo.ChannelTypeGuildNewsThread
+	case "voice":
+		return discordgo.ChannelTypeGuildVoice
+	default:
+		return discordgo.ChannelTypeGuildText
+	}
+}
+
 func maxSnowflake(current, candidate string) string {
 	if current == "" {
 		return candidate
@@ -714,4 +820,12 @@ func maxSnowflake(current, candidate string) string {
 		return candidate
 	}
 	return current
+}
+
+func isMissingAccess(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "403 Forbidden") || strings.Contains(msg, "Missing Access")
 }

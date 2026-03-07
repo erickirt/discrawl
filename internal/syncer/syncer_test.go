@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -23,8 +24,12 @@ type fakeClient struct {
 	privateArchive map[string][]*discordgo.Channel
 	members        map[string][]*discordgo.Member
 	messages       map[string][]*discordgo.Message
+	messageErrors  map[string]error
 	tailCalls      int
 	messageDelay   time.Duration
+	guildChanCalls int
+	threadCalls    int
+	memberCalls    int
 	mu             sync.Mutex
 	inFlight       int
 	maxInFlight    int
@@ -40,21 +45,28 @@ func (f *fakeClient) Guild(_ context.Context, guildID string) (*discordgo.Guild,
 	return f.guildByID[guildID], nil
 }
 func (f *fakeClient) GuildChannels(_ context.Context, guildID string) ([]*discordgo.Channel, error) {
+	f.guildChanCalls++
 	return f.channels[guildID], nil
 }
 func (f *fakeClient) ThreadsActive(_ context.Context, channelID string) ([]*discordgo.Channel, error) {
+	f.threadCalls++
 	return f.activeThreads[channelID], nil
 }
 func (f *fakeClient) ThreadsArchived(_ context.Context, channelID string, private bool) ([]*discordgo.Channel, error) {
+	f.threadCalls++
 	if private {
 		return f.privateArchive[channelID], nil
 	}
 	return f.publicArchived[channelID], nil
 }
 func (f *fakeClient) GuildMembers(_ context.Context, guildID string) ([]*discordgo.Member, error) {
+	f.memberCalls++
 	return f.members[guildID], nil
 }
 func (f *fakeClient) ChannelMessages(_ context.Context, channelID string, limit int, beforeID, afterID string) ([]*discordgo.Message, error) {
+	if err := f.messageErrors[channelID]; err != nil {
+		return nil, err
+	}
 	if f.messageDelay > 0 {
 		f.mu.Lock()
 		f.inFlight++
@@ -223,6 +235,90 @@ func TestSyncUsesConfiguredConcurrency(t *testing.T) {
 	require.GreaterOrEqual(t, maxInFlight, 2)
 }
 
+func TestSyncChannelSubsetUsesStoredMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	require.NoError(t, s.UpsertGuild(ctx, store.GuildRecord{ID: "g1", Name: "Guild", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, store.ChannelRecord{
+		ID:      "c1",
+		GuildID: "g1",
+		Kind:    "text",
+		Name:    "general",
+		RawJSON: `{"id":"c1"}`,
+	}))
+
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		messages: map[string][]*discordgo.Message{
+			"c1": {{
+				ID:        "10",
+				GuildID:   "g1",
+				ChannelID: "c1",
+				Content:   "hello",
+				Timestamp: time.Now().UTC(),
+				Author:    &discordgo.User{ID: "u1", Username: "user"},
+			}},
+		},
+	}
+
+	svc := New(client, s, nil)
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true, GuildIDs: []string{"g1"}, ChannelIDs: []string{"c1"}})
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Messages)
+	require.Zero(t, client.guildChanCalls)
+	require.Zero(t, client.threadCalls)
+	require.Zero(t, client.memberCalls)
+
+	cursor, err := s.GetSyncState(ctx, "channel:c1:latest_message_id")
+	require.NoError(t, err)
+	require.Equal(t, "10", cursor)
+}
+
+func TestSyncSkipsMissingAccessChannels(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		channels: map[string][]*discordgo.Channel{
+			"g1": {
+				{ID: "c1", GuildID: "g1", Name: "general", Type: discordgo.ChannelTypeGuildText},
+				{ID: "c2", GuildID: "g1", Name: "private", Type: discordgo.ChannelTypeGuildText},
+			},
+		},
+		messages: map[string][]*discordgo.Message{
+			"c1": {{ID: "10", GuildID: "g1", ChannelID: "c1", Content: "ok", Timestamp: time.Now().UTC(), Author: &discordgo.User{ID: "u1", Username: "user"}}},
+		},
+		messageErrors: map[string]error{
+			"c2": fmt.Errorf("HTTP 403 Forbidden, {\"message\": \"Missing Access\", \"code\": 50001}"),
+		},
+	}
+
+	svc := New(client, s, nil)
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true, Concurrency: 2})
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Messages)
+
+	cursor, err := s.GetSyncState(ctx, "channel:c2:unavailable")
+	require.NoError(t, err)
+	require.Equal(t, "missing_access", cursor)
+}
+
 func TestNormalizeMessageIncludesRichFields(t *testing.T) {
 	t.Parallel()
 
@@ -308,6 +404,8 @@ func TestHelpers(t *testing.T) {
 	require.Equal(t, "thread_private", channelKind(&discordgo.Channel{Type: discordgo.ChannelTypeGuildPrivateThread}))
 	require.Equal(t, "announcement", channelKind(&discordgo.Channel{Type: discordgo.ChannelTypeGuildNews}))
 	require.Equal(t, "voice", channelKind(&discordgo.Channel{Type: discordgo.ChannelTypeGuildVoice}))
+	require.Equal(t, discordgo.ChannelTypeGuildPublicThread, channelTypeFromKind("thread_public"))
+	require.Equal(t, discordgo.ChannelTypeGuildText, channelTypeFromKind("unknown"))
 	require.True(t, isThreadParent(&discordgo.Channel{Type: discordgo.ChannelTypeGuildForum}))
 	require.False(t, isThreadParent(&discordgo.Channel{Type: discordgo.ChannelTypeGuildVoice}))
 	require.True(t, isMessageChannel(&discordgo.Channel{Type: discordgo.ChannelTypeGuildNewsThread}))
