@@ -24,7 +24,7 @@ import (
 	"github.com/steipete/discrawl/internal/syncer"
 )
 
-const version = "dev"
+const version = "0.1.0"
 
 type cliError struct {
 	code int
