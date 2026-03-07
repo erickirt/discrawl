@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.1
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test with coverage
+        run: go test ./... -coverprofile=coverage.out
+
+      - name: Enforce coverage floor
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ { sub(/%$/, "", $3); print $3 }')"
+          awk -v total="$total" 'BEGIN {
+            if (total == "") {
+              print "missing coverage total"
+              exit 1
+            }
+            if (total + 0 < 80.0) {
+              printf("coverage %.1f%% is below 80%%\n", total + 0)
+              exit 1
+            }
+            printf("coverage %.1f%%\n", total + 0)
+          }'
+
+      - name: Build
+        run: go build ./cmd/discrawl
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.0
+
+      - name: Scan git history
+        run: |
+          "$(go env GOPATH)/bin/gitleaks" git --no-banner --redact
+
+      - name: Scan working tree
+        run: |
+          "$(go env GOPATH)/bin/gitleaks" dir . --no-banner --redact
