@@ -232,7 +232,7 @@ func (s *Syncer) syncMessageChannels(
 	if workers == 1 {
 		total := 0
 		for _, channel := range messageChannels {
-			count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full)
+			count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full, opts.Embeddings)
 			if err != nil {
 				if s.skipUnavailableChannel(ctx, channel, err) {
 					continue
@@ -264,7 +264,7 @@ func (s *Syncer) syncMessageChannels(
 				if ctx.Err() != nil {
 					return
 				}
-				count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full)
+				count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full, opts.Embeddings)
 				if err != nil && s.skipUnavailableChannel(ctx, channel, err) {
 					err = nil
 				}
@@ -319,7 +319,7 @@ func (s *Syncer) skipUnavailableChannel(ctx context.Context, channel *discordgo.
 	return true
 }
 
-func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channel *discordgo.Channel, full bool) (int, error) {
+func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channel *discordgo.Channel, full bool, embeddings bool) (int, error) {
 	scope := "channel:" + channel.ID + ":latest_message_id"
 	latest, err := s.store.GetSyncState(ctx, scope)
 	if err != nil {
@@ -347,6 +347,9 @@ func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channe
 					Record:      record,
 					EventType:   "upsert",
 					PayloadJSON: record.RawJSON,
+					Options: store.WriteOptions{
+						EnqueueEmbedding: embeddings,
+					},
 				})
 				newest = maxSnowflake(newest, message.ID)
 				messageCount++
@@ -376,6 +379,9 @@ func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channe
 					Record:      record,
 					EventType:   "upsert",
 					PayloadJSON: record.RawJSON,
+					Options: store.WriteOptions{
+						EnqueueEmbedding: embeddings,
+					},
 				})
 				after = maxSnowflake(after, message.ID)
 				newest = maxSnowflake(newest, message.ID)
@@ -436,7 +442,7 @@ func (t *tailHandler) OnMessageCreate(ctx context.Context, msg *discordgo.Messag
 	if !t.allowGuild(msg.GuildID) {
 		return nil
 	}
-	if err := t.store.UpsertMessage(ctx, toMessageRecord(msg, "")); err != nil {
+	if err := t.store.UpsertMessageWithOptions(ctx, toMessageRecord(msg, ""), store.WriteOptions{}); err != nil {
 		return err
 	}
 	if err := t.store.AppendMessageEvent(ctx, msg.GuildID, msg.ChannelID, msg.ID, "create", msg); err != nil {
@@ -452,7 +458,7 @@ func (t *tailHandler) OnMessageUpdate(ctx context.Context, msg *discordgo.Messag
 	if !t.allowGuild(msg.GuildID) {
 		return nil
 	}
-	if err := t.store.UpsertMessage(ctx, toMessageRecord(msg, "")); err != nil {
+	if err := t.store.UpsertMessageWithOptions(ctx, toMessageRecord(msg, ""), store.WriteOptions{}); err != nil {
 		return err
 	}
 	if err := t.store.AppendMessageEvent(ctx, msg.GuildID, msg.ChannelID, msg.ID, "update", msg); err != nil {

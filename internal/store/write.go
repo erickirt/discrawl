@@ -69,6 +69,12 @@ type MessageMutation struct {
 	Record      MessageRecord
 	EventType   string
 	PayloadJSON string
+	Options     WriteOptions
+}
+
+type WriteOptions struct {
+	AppendEvent      bool
+	EnqueueEmbedding bool
 }
 
 func (s *Store) UpsertGuild(ctx context.Context, guild GuildRecord) error {
@@ -175,12 +181,16 @@ func (s *Store) DeleteMember(ctx context.Context, guildID, userID string) error 
 }
 
 func (s *Store) UpsertMessage(ctx context.Context, message MessageRecord) error {
+	return s.UpsertMessageWithOptions(ctx, message, WriteOptions{})
+}
+
+func (s *Store) UpsertMessageWithOptions(ctx context.Context, message MessageRecord, opts WriteOptions) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer rollback(tx)
-	if err := upsertMessageTx(ctx, tx, message); err != nil {
+	if err := upsertMessageTx(ctx, tx, message, opts); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -196,10 +206,10 @@ func (s *Store) UpsertMessages(ctx context.Context, messages []MessageMutation) 
 	}
 	defer rollback(tx)
 	for _, message := range messages {
-		if err := upsertMessageTx(ctx, tx, message.Record); err != nil {
+		if err := upsertMessageTx(ctx, tx, message.Record, message.Options); err != nil {
 			return err
 		}
-		if message.EventType != "" {
+		if message.Options.AppendEvent && message.EventType != "" {
 			if err := appendEventTx(
 				ctx,
 				tx,
@@ -216,7 +226,7 @@ func (s *Store) UpsertMessages(ctx context.Context, messages []MessageMutation) 
 	return tx.Commit()
 }
 
-func upsertMessageTx(ctx context.Context, tx *sql.Tx, message MessageRecord) error {
+func upsertMessageTx(ctx context.Context, tx *sql.Tx, message MessageRecord, opts WriteOptions) error {
 	now := time.Now().UTC().Format(timeLayout)
 	if _, err := tx.ExecContext(ctx, `
 		insert into messages(
@@ -254,12 +264,14 @@ func upsertMessageTx(ctx context.Context, tx *sql.Tx, message MessageRecord) err
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `
-		insert into embedding_jobs(message_id, state, attempts, updated_at)
-		values(?, 'pending', 0, ?)
-		on conflict(message_id) do nothing
-	`, message.ID, now); err != nil {
-		return err
+	if opts.EnqueueEmbedding {
+		if _, err := tx.ExecContext(ctx, `
+			insert into embedding_jobs(message_id, state, attempts, updated_at)
+			values(?, 'pending', 0, ?)
+			on conflict(message_id) do nothing
+		`, message.ID, now); err != nil {
+			return err
+		}
 	}
 	return nil
 }

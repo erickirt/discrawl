@@ -230,6 +230,9 @@ func TestUpsertMessagesBatch(t *testing.T) {
 			},
 			EventType:   "upsert",
 			PayloadJSON: `{"id":"m1"}`,
+			Options: WriteOptions{
+				AppendEvent: true,
+			},
 		},
 		{
 			Record: MessageRecord{
@@ -244,6 +247,9 @@ func TestUpsertMessagesBatch(t *testing.T) {
 			},
 			EventType:   "upsert",
 			PayloadJSON: `{"id":"m2"}`,
+			Options: WriteOptions{
+				AppendEvent: true,
+			},
 		},
 	}))
 
@@ -254,6 +260,63 @@ func TestUpsertMessagesBatch(t *testing.T) {
 	_, rows, err = s.ReadOnlyQuery(ctx, "select count(*) from message_events")
 	require.NoError(t, err)
 	require.Equal(t, "2", rows[0][0])
+}
+
+func TestUpsertMessagesSkipsEventsAndEmbeddingsByDefault(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	require.NoError(t, s.UpsertMessages(ctx, []MessageMutation{{
+		Record: MessageRecord{
+			ID:                "m1",
+			GuildID:           "g1",
+			ChannelID:         "c1",
+			MessageType:       0,
+			CreatedAt:         now,
+			Content:           "one",
+			NormalizedContent: "one",
+			RawJSON:           `{"id":"m1"}`,
+		},
+		EventType:   "upsert",
+		PayloadJSON: `{"id":"m1"}`,
+	}}))
+
+	_, rows, err := s.ReadOnlyQuery(ctx, "select count(*) from message_events")
+	require.NoError(t, err)
+	require.Equal(t, "0", rows[0][0])
+
+	_, rows, err = s.ReadOnlyQuery(ctx, "select count(*) from embedding_jobs")
+	require.NoError(t, err)
+	require.Equal(t, "0", rows[0][0])
+}
+
+func TestUpsertMessageWithEmbeddingsQueuesJob(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	require.NoError(t, s.UpsertMessageWithOptions(ctx, MessageRecord{
+		ID:                "m1",
+		GuildID:           "g1",
+		ChannelID:         "c1",
+		MessageType:       0,
+		CreatedAt:         time.Now().UTC().Format(time.RFC3339Nano),
+		Content:           "hello",
+		NormalizedContent: "hello",
+		RawJSON:           `{}`,
+	}, WriteOptions{EnqueueEmbedding: true}))
+
+	_, rows, err := s.ReadOnlyQuery(ctx, "select count(*) from embedding_jobs")
+	require.NoError(t, err)
+	require.Equal(t, "1", rows[0][0])
 }
 
 func TestConcurrentMessageUpsertsShareSingleWriter(t *testing.T) {
