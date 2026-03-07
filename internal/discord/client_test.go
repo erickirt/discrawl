@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -278,6 +279,88 @@ func TestTailReceivesGatewayEvents(t *testing.T) {
 	require.Equal(t, 1, handler.memberDeletes)
 }
 
+func TestTailFailsFastWhenWorkerQueueFills(t *testing.T) {
+	mux := http.NewServeMux()
+	upgrader := websocket.Upgrader{}
+	gatewayURL := ""
+	mux.HandleFunc("/api/v10/gateway", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"url": gatewayURL})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	gatewayURL = "ws" + server.URL[len("http"):] + "/gateway"
+	gatewayHandler := func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade gateway: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.WriteJSON(map[string]any{
+			"op": 10,
+			"d":  map[string]any{"heartbeat_interval": 1000},
+		}); err != nil {
+			t.Errorf("write hello: %v", err)
+			return
+		}
+		_, _, err = conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read identify: %v", err)
+			return
+		}
+		if err := conn.WriteJSON(map[string]any{
+			"op": 0,
+			"t":  "READY",
+			"s":  1,
+			"d": map[string]any{
+				"session_id": "session",
+				"user":       map[string]any{"id": "bot", "username": "bot"},
+			},
+		}); err != nil {
+			t.Errorf("write ready: %v", err)
+			return
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		for i := 0; i < 4; i++ {
+			if err := conn.WriteJSON(map[string]any{
+				"op": 0,
+				"t":  "MESSAGE_CREATE",
+				"s":  i + 2,
+				"d": map[string]any{
+					"id":         fmt.Sprintf("m%d", i),
+					"guild_id":   "g1",
+					"channel_id": "c1",
+					"content":    "hello",
+					"timestamp":  now,
+					"author":     map[string]any{"id": "u1", "username": "user"},
+				},
+			}); err != nil {
+				t.Errorf("write create %d: %v", i, err)
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mux.HandleFunc("/gateway", gatewayHandler)
+	mux.HandleFunc("/gateway/", gatewayHandler)
+
+	restore := patchDiscordEndpoints(server.URL + "/api/v10/")
+	defer restore()
+
+	client, err := New("token")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	client.tailWorkerCount = 1
+	client.tailQueueSize = 1
+	client.tailHandlerTimeout = time.Second
+
+	err = client.Tail(context.Background(), &slowHandler{sleep: 200 * time.Millisecond})
+	require.ErrorContains(t, err, "tail worker queue full")
+}
+
 func writeJSON(v any) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -379,5 +462,34 @@ func (r *recordingHandler) OnMemberUpsert(context.Context, string, *discordgo.Me
 
 func (r *recordingHandler) OnMemberDelete(context.Context, string, string) error {
 	r.memberDeletes++
+	return nil
+}
+
+type slowHandler struct {
+	sleep time.Duration
+}
+
+func (s *slowHandler) OnMessageCreate(context.Context, *discordgo.Message) error {
+	time.Sleep(s.sleep)
+	return nil
+}
+
+func (s *slowHandler) OnMessageUpdate(context.Context, *discordgo.Message) error {
+	return nil
+}
+
+func (s *slowHandler) OnMessageDelete(context.Context, *discordgo.MessageDelete) error {
+	return nil
+}
+
+func (s *slowHandler) OnChannelUpsert(context.Context, *discordgo.Channel) error {
+	return nil
+}
+
+func (s *slowHandler) OnMemberUpsert(context.Context, string, *discordgo.Member) error {
+	return nil
+}
+
+func (s *slowHandler) OnMemberDelete(context.Context, string, string) error {
 	return nil
 }

@@ -3,7 +3,9 @@ package discord
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -19,8 +21,11 @@ type EventHandler interface {
 }
 
 type Client struct {
-	session        *discordgo.Session
-	requestTimeout time.Duration
+	session            *discordgo.Session
+	requestTimeout     time.Duration
+	tailWorkerCount    int
+	tailQueueSize      int
+	tailHandlerTimeout time.Duration
 }
 
 func New(token string) (*Client, error) {
@@ -33,8 +38,11 @@ func New(token string) (*Client, error) {
 		discordgo.IntentsMessageContent |
 		discordgo.IntentsGuildMembers
 	return &Client{
-		session:        session,
-		requestTimeout: 45 * time.Second,
+		session:            session,
+		requestTimeout:     45 * time.Second,
+		tailWorkerCount:    defaultTailWorkerCount(),
+		tailQueueSize:      defaultTailQueueSize(),
+		tailHandlerTimeout: 30 * time.Second,
 	}, nil
 }
 
@@ -163,64 +171,74 @@ func (c *Client) Tail(ctx context.Context, handler EventHandler) error {
 	if handler == nil {
 		return fmt.Errorf("missing event handler")
 	}
+	tailCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	errCh := make(chan error, 1)
-	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.MessageCreate) {
-		if err := handler.OnMessageCreate(ctx, evt.Message); err != nil {
-			select {
-			case errCh <- err:
-			default:
+	workCh := make(chan func(context.Context) error, c.tailQueueSize)
+	var wg sync.WaitGroup
+	for i := 0; i < c.tailWorkerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-tailCtx.Done():
+					return
+				case task := <-workCh:
+					if task == nil {
+						continue
+					}
+					if err := c.runTailTask(tailCtx, task); err != nil {
+						select {
+						case errCh <- err:
+						default:
+						}
+					}
+				}
 			}
-		}
+		}()
+	}
+
+	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.MessageCreate) {
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnMessageCreate(taskCtx, evt.Message)
+		})
 	})
 	c.session.AddHandler(func(session *discordgo.Session, evt *discordgo.MessageUpdate) {
-		msg := evt.Message
-		if msg != nil && msg.Content == "" {
-			full, err := session.ChannelMessage(evt.ChannelID, evt.ID)
-			if err == nil {
-				msg = full
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			msg := evt.Message
+			if msg != nil && msg.Content == "" {
+				full, err := session.ChannelMessage(evt.ChannelID, evt.ID, discordgo.WithContext(taskCtx))
+				if err == nil {
+					msg = full
+				}
 			}
-		}
-		if msg == nil {
-			return
-		}
-		if err := handler.OnMessageUpdate(ctx, msg); err != nil {
-			select {
-			case errCh <- err:
-			default:
+			if msg == nil {
+				return nil
 			}
-		}
+			return handler.OnMessageUpdate(taskCtx, msg)
+		})
 	})
 	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.MessageDelete) {
-		if err := handler.OnMessageDelete(ctx, evt); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnMessageDelete(taskCtx, evt)
+		})
 	})
 	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.ChannelCreate) {
-		if err := handler.OnChannelUpsert(ctx, evt.Channel); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnChannelUpsert(taskCtx, evt.Channel)
+		})
 	})
 	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.ChannelUpdate) {
-		if err := handler.OnChannelUpsert(ctx, evt.Channel); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnChannelUpsert(taskCtx, evt.Channel)
+		})
 	})
 	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberAdd) {
-		if err := handler.OnMemberUpsert(ctx, evt.GuildID, evt.Member); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnMemberUpsert(taskCtx, evt.GuildID, evt.Member)
+		})
 	})
 	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberUpdate) {
 		member := &discordgo.Member{
@@ -231,34 +249,83 @@ func (c *Client) Tail(ctx context.Context, handler EventHandler) error {
 			JoinedAt: evt.JoinedAt,
 			User:     evt.User,
 		}
-		if err := handler.OnMemberUpsert(ctx, evt.GuildID, member); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnMemberUpsert(taskCtx, evt.GuildID, member)
+		})
 	})
 	c.session.AddHandler(func(_ *discordgo.Session, evt *discordgo.GuildMemberRemove) {
 		if evt.User == nil {
 			return
 		}
-		if err := handler.OnMemberDelete(ctx, evt.GuildID, evt.User.ID); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
+		c.enqueueTailTask(tailCtx, workCh, errCh, func(taskCtx context.Context) error {
+			return handler.OnMemberDelete(taskCtx, evt.GuildID, evt.User.ID)
+		})
 	})
 	if err := c.session.Open(); err != nil {
 		return err
 	}
-	defer func() { _ = c.session.Close() }()
+	defer func() {
+		cancel()
+		_ = c.session.Close()
+		wg.Wait()
+	}()
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-errCh:
 		return err
 	}
+}
+
+func (c *Client) enqueueTailTask(
+	ctx context.Context,
+	workCh chan<- func(context.Context) error,
+	errCh chan<- error,
+	task func(context.Context) error,
+) {
+	select {
+	case <-ctx.Done():
+		return
+	case workCh <- task:
+	default:
+		select {
+		case errCh <- fmt.Errorf("tail worker queue full"):
+		default:
+		}
+	}
+}
+
+func (c *Client) runTailTask(ctx context.Context, task func(context.Context) error) (err error) {
+	taskCtx := ctx
+	cancel := func() {}
+	if c.tailHandlerTimeout > 0 {
+		taskCtx, cancel = context.WithTimeout(ctx, c.tailHandlerTimeout)
+	} else {
+		taskCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("tail handler panic: %v", recovered)
+		}
+	}()
+	return task(taskCtx)
+}
+
+func defaultTailWorkerCount() int {
+	workers := runtime.GOMAXPROCS(0)
+	switch {
+	case workers < 4:
+		return 4
+	case workers > 16:
+		return 16
+	default:
+		return workers
+	}
+}
+
+func defaultTailQueueSize() int {
+	return defaultTailWorkerCount() * 32
 }
 
 func uniqueChannels(in []*discordgo.Channel) []*discordgo.Channel {
