@@ -97,6 +97,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runtime.withServices(true, func() error { return runtime.runTail(rest[1:]) })
 	case "search":
 		return runtime.withServices(false, func() error { return runtime.runSearch(rest[1:]) })
+	case "messages":
+		return runtime.withServices(false, func() error { return runtime.runMessages(rest[1:]) })
 	case "sql":
 		return runtime.withServices(false, func() error { return runtime.runSQL(rest[1:]) })
 	case "members":
@@ -127,6 +129,7 @@ type runtime struct {
 	openStore  func(context.Context, string) (*store.Store, error)
 	newDiscord func(config.Config) (discordClient, error)
 	newSyncer  func(syncer.Client, *store.Store, *slog.Logger) syncService
+	now        func() time.Time
 }
 
 type discordClient interface {
@@ -548,6 +551,11 @@ func (r *runtime) print(value any) error {
 				_, _ = fmt.Fprintf(r.stdout, "%s\t%s\t%s\t%s\n", row.GuildID, row.ID, row.Kind, row.Name)
 			}
 			return nil
+		case []store.MessageRow:
+			for _, row := range v {
+				_, _ = fmt.Fprintf(r.stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", formatTime(row.CreatedAt), row.GuildID, row.ChannelID, row.AuthorID, row.MessageID, row.Content)
+			}
+			return nil
 		}
 	}
 	if err := printHuman(r.stdout, value); err == nil {
@@ -569,6 +577,7 @@ Commands:
   sync
   tail
   search
+  messages
   sql
   members
   channels
@@ -653,6 +662,13 @@ func printHuman(w io.Writer, value any) error {
 			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", row.GuildID, row.ID, row.Kind, row.Name)
 		}
 		return tw.Flush()
+	case []store.MessageRow:
+		for _, row := range v {
+			if _, err := fmt.Fprintf(w, "[%s/%s] %s %s\n%s\n\n", row.GuildID, row.ChannelName, row.AuthorName, formatTime(row.CreatedAt), row.Content); err != nil {
+				return err
+			}
+		}
+		return nil
 	case map[string]any:
 		keys := make([]string, 0, len(v))
 		for key := range v {

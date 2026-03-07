@@ -92,6 +92,15 @@ func TestStoreReadWriteAndSearch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "m1", oldest)
 	require.Equal(t, "m1", newest)
+
+	messageRows, err := s.ListMessages(ctx, MessageListOptions{
+		Channel: "#general",
+		Since:   parseTime("2000-01-01T00:00:00Z"),
+	})
+	require.NoError(t, err)
+	require.Len(t, messageRows, 1)
+	require.Equal(t, "m1", messageRows[0].MessageID)
+	require.Equal(t, "Peter", messageRows[0].AuthorName)
 }
 
 func TestReadOnlyQueryGuards(t *testing.T) {
@@ -210,6 +219,121 @@ func TestEventsSyncStateAndHelpers(t *testing.T) {
 	empty, err := s.GetSyncState(ctx, "missing")
 	require.NoError(t, err)
 	require.Empty(t, empty)
+
+	require.Equal(t, "maintainers", normalizeChannelFilter("#maintainers"))
+	require.Equal(t, "maintainers", normalizeChannelFilter(" maintainers "))
+}
+
+func TestListMessagesFiltersAndLimit(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "c1", GuildID: "g1", Kind: "text", Name: "maintainers", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "c2", GuildID: "g1", Kind: "text", Name: "random", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertMember(ctx, MemberRecord{
+		GuildID:     "g1",
+		UserID:      "u1",
+		Username:    "peter",
+		DisplayName: "Peter",
+		RoleIDsJSON: `[]`,
+		RawJSON:     `{}`,
+	}))
+
+	require.NoError(t, s.UpsertMessage(ctx, MessageRecord{
+		ID:                "m1",
+		GuildID:           "g1",
+		ChannelID:         "c1",
+		ChannelName:       "maintainers",
+		AuthorID:          "u1",
+		AuthorName:        "Peter",
+		MessageType:       0,
+		CreatedAt:         "2026-03-01T10:00:00Z",
+		Content:           "first",
+		NormalizedContent: "first",
+		RawJSON:           `{"author":{"username":"peter"}}`,
+	}))
+	require.NoError(t, s.UpsertMessage(ctx, MessageRecord{
+		ID:                "m2",
+		GuildID:           "g1",
+		ChannelID:         "c1",
+		ChannelName:       "maintainers",
+		AuthorID:          "u1",
+		AuthorName:        "Peter",
+		MessageType:       0,
+		CreatedAt:         "2026-03-02T10:00:00Z",
+		Content:           "second",
+		NormalizedContent: "second",
+		RawJSON:           `{"author":{"username":"peter"}}`,
+	}))
+	require.NoError(t, s.UpsertMessage(ctx, MessageRecord{
+		ID:                "m3",
+		GuildID:           "g1",
+		ChannelID:         "c2",
+		ChannelName:       "random",
+		AuthorID:          "u1",
+		AuthorName:        "Peter",
+		MessageType:       0,
+		CreatedAt:         "2026-03-03T10:00:00Z",
+		Content:           "ignore",
+		NormalizedContent: "ignore",
+		RawJSON:           `{"author":{"username":"peter"}}`,
+	}))
+
+	rows, err := s.ListMessages(ctx, MessageListOptions{
+		Channel: "#maintainer",
+		Since:   parseTime("2026-03-01T12:00:00Z"),
+		Author:  "Peter",
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "m2", rows[0].MessageID)
+
+	rows, err = s.ListMessages(ctx, MessageListOptions{
+		Channel: "maintainers",
+		Limit:   1,
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "m1", rows[0].MessageID)
+
+	require.NoError(t, s.UpsertMessage(ctx, MessageRecord{
+		ID:                "m4",
+		GuildID:           "g1",
+		ChannelID:         "c1",
+		ChannelName:       "maintainers",
+		AuthorID:          "u2",
+		MessageType:       0,
+		CreatedAt:         "2026-03-04T10:00:00Z",
+		Content:           "third",
+		NormalizedContent: "third",
+		Pinned:            true,
+		HasAttachments:    true,
+		RawJSON:           `{"author":{"username":"fallback-user"}}`,
+	}))
+
+	rows, err = s.ListMessages(ctx, MessageListOptions{
+		Channel: "c1",
+		Before:  parseTime("2026-03-04T00:00:00Z"),
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	require.Equal(t, "m1", rows[0].MessageID)
+	require.Equal(t, "m2", rows[1].MessageID)
+
+	rows, err = s.ListMessages(ctx, MessageListOptions{
+		Channel: "maintainers",
+		Author:  "fallback-user",
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "m4", rows[0].MessageID)
+	require.Equal(t, "fallback-user", rows[0].AuthorName)
+	require.True(t, rows[0].Pinned)
+	require.True(t, rows[0].HasAttachments)
 }
 
 func TestUpsertMessagesBatch(t *testing.T) {

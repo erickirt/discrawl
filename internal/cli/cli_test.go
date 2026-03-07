@@ -67,6 +67,7 @@ func TestStatusSearchSQLAndListings(t *testing.T) {
 	tests := [][]string{
 		{"--config", cfgPath, "status"},
 		{"--config", cfgPath, "search", "panic"},
+		{"--config", cfgPath, "messages", "--channel", "general", "--days", "7", "--all"},
 		{"--config", cfgPath, "sql", "select count(*) as total from messages"},
 		{"--config", cfgPath, "members", "list"},
 		{"--config", cfgPath, "channels", "list"},
@@ -254,6 +255,8 @@ func TestRuntimeHelpersAndSubcommands(t *testing.T) {
 		require.NoError(t, rt.runMembers([]string{"show", "u1"}))
 		require.NoError(t, rt.runMembers([]string{"search", "pet"}))
 		require.NoError(t, rt.runMembers([]string{"list"}))
+		rt.now = func() time.Time { return time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC) }
+		require.NoError(t, rt.runMessages([]string{"--channel", "#general", "--days", "7", "--all"}))
 		require.NoError(t, rt.runChannels([]string{"show", "c1"}))
 		require.NoError(t, rt.runChannels([]string{"list"}))
 		require.NoError(t, rt.runStatus(nil))
@@ -283,6 +286,10 @@ func TestPrintJSONAndPlain(t *testing.T) {
 	rt = &runtime{stdout: &bytes.Buffer{}, plain: true}
 	require.NoError(t, rt.print([]store.SearchResult{{GuildID: "g1", ChannelID: "c1", AuthorID: "u1", Content: "hello"}}))
 	require.Contains(t, rt.stdout.(*bytes.Buffer).String(), "hello")
+
+	rt = &runtime{stdout: &bytes.Buffer{}, plain: true}
+	require.NoError(t, rt.print([]store.MessageRow{{GuildID: "g1", ChannelID: "c1", AuthorID: "u1", MessageID: "m1", Content: "hello", CreatedAt: time.Unix(1, 0).UTC()}}))
+	require.Contains(t, rt.stdout.(*bytes.Buffer).String(), "m1")
 
 	rt = &runtime{stdout: &bytes.Buffer{}}
 	require.NoError(t, rt.print(struct{ OK bool }{OK: true}))
@@ -330,6 +337,9 @@ func TestCommandUsageErrors(t *testing.T) {
 	rt := &runtime{}
 	require.Equal(t, 2, ExitCode(rt.runMembers(nil)))
 	require.Equal(t, 2, ExitCode(rt.runMembers([]string{"nope"})))
+	require.Equal(t, 2, ExitCode(rt.runMessages(nil)))
+	require.Equal(t, 2, ExitCode(rt.runMessages([]string{"--days", "-1"})))
+	require.Equal(t, 2, ExitCode(rt.runMessages([]string{"--days", "1", "--since", "2026-03-01T00:00:00Z"})))
 	require.Equal(t, 2, ExitCode(rt.runChannels(nil)))
 	require.Equal(t, 2, ExitCode(rt.runStatus([]string{"extra"})))
 	require.NoError(t, (&runtime{stdout: &bytes.Buffer{}}).runDoctor(nil))
