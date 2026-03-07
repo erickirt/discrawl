@@ -26,6 +26,7 @@ type fakeClient struct {
 	members        map[string][]*discordgo.Member
 	messages       map[string][]*discordgo.Message
 	messageErrors  map[string]error
+	beforeErrors   map[string]map[string]error
 	tailCalls      int
 	messageDelay   time.Duration
 	guildChanCalls int
@@ -75,6 +76,9 @@ func (f *fakeClient) ChannelMessages(_ context.Context, channelID string, limit 
 	if err := f.messageErrors[channelID]; err != nil {
 		return nil, err
 	}
+	if err := f.beforeErrors[channelID][beforeID]; err != nil {
+		return nil, err
+	}
 	if f.messageDelay > 0 {
 		f.mu.Lock()
 		f.inFlight++
@@ -103,7 +107,16 @@ func (f *fakeClient) ChannelMessages(_ context.Context, channelID string, limit 
 		}
 		return all[:limit], nil
 	}
-	return nil, nil
+	var filtered []*discordgo.Message
+	for _, msg := range all {
+		if msg.ID < beforeID {
+			filtered = append(filtered, msg)
+		}
+	}
+	if len(filtered) <= limit {
+		return filtered, nil
+	}
+	return filtered[:limit], nil
 }
 
 func (f *fakeClient) ChannelMessage(_ context.Context, channelID, messageID string) (*discordgo.Message, error) {
@@ -407,6 +420,86 @@ func TestSyncSkipsRetryableChannelErrors(t *testing.T) {
 	require.Empty(t, unavailable)
 }
 
+func TestSyncFullBackfillResumesFromCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	messages := make([]*discordgo.Message, 0, 150)
+	for id := 250; id >= 101; id-- {
+		messages = append(messages, &discordgo.Message{
+			ID:        fmt.Sprintf("%03d", id),
+			GuildID:   "g1",
+			ChannelID: "c1",
+			Content:   fmt.Sprintf("msg-%03d", id),
+			Timestamp: time.Now().UTC(),
+			Author:    &discordgo.User{ID: "u1", Username: "user"},
+		})
+	}
+
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		channels: map[string][]*discordgo.Channel{
+			"g1": {{ID: "c1", GuildID: "g1", Name: "general", Type: discordgo.ChannelTypeGuildText}},
+		},
+		messages: map[string][]*discordgo.Message{
+			"c1": messages,
+		},
+		beforeErrors: map[string]map[string]error{
+			"c1": {"151": context.DeadlineExceeded},
+		},
+	}
+
+	svc := New(client, s, nil)
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true, Concurrency: 1})
+	require.NoError(t, err)
+	require.Equal(t, 100, stats.Messages)
+
+	latest, err := s.GetSyncState(ctx, channelLatestScope("c1"))
+	require.NoError(t, err)
+	require.Equal(t, "250", latest)
+
+	backfill, err := s.GetSyncState(ctx, channelBackfillScope("c1"))
+	require.NoError(t, err)
+	require.Equal(t, "151", backfill)
+
+	complete, err := s.GetSyncState(ctx, channelHistoryCompleteScope("c1"))
+	require.NoError(t, err)
+	require.Empty(t, complete)
+
+	delete(client.beforeErrors["c1"], "151")
+	client.messages["c1"] = append([]*discordgo.Message{{
+		ID:        "251",
+		GuildID:   "g1",
+		ChannelID: "c1",
+		Content:   "msg-251",
+		Timestamp: time.Now().UTC(),
+		Author:    &discordgo.User{ID: "u1", Username: "user"},
+	}}, client.messages["c1"]...)
+
+	stats, err = svc.Sync(ctx, SyncOptions{Full: true, Concurrency: 1})
+	require.NoError(t, err)
+	require.Equal(t, 51, stats.Messages)
+
+	latest, err = s.GetSyncState(ctx, channelLatestScope("c1"))
+	require.NoError(t, err)
+	require.Equal(t, "251", latest)
+
+	complete, err = s.GetSyncState(ctx, channelHistoryCompleteScope("c1"))
+	require.NoError(t, err)
+	require.Equal(t, "1", complete)
+
+	results, err := s.SearchMessages(ctx, store.SearchOptions{Query: "msg-101", Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+}
+
 func TestSyncMarksEmptyChannelComplete(t *testing.T) {
 	t.Parallel()
 
@@ -438,6 +531,10 @@ func TestSyncMarksEmptyChannelComplete(t *testing.T) {
 	cursor, err := s.GetSyncState(ctx, "channel:c1:latest_message_id")
 	require.NoError(t, err)
 	require.Empty(t, cursor)
+
+	complete, err := s.GetSyncState(ctx, channelHistoryCompleteScope("c1"))
+	require.NoError(t, err)
+	require.Equal(t, "1", complete)
 
 	cols, rows, err := s.ReadOnlyQuery(ctx, `select count(*) from sync_state where scope = 'channel:c1:latest_message_id'`)
 	require.NoError(t, err)

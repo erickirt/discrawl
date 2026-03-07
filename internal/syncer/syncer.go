@@ -235,13 +235,13 @@ func (s *Syncer) syncMessageChannels(
 		total := 0
 		for _, channel := range messageChannels {
 			count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full, opts.Embeddings)
+			total += count
 			if err != nil {
 				if s.skipSyncError(ctx, channel, err) {
 					continue
 				}
 				return total, fmt.Errorf("sync channel %s: %w", channel.ID, err)
 			}
-			total += count
 		}
 		return total, nil
 	}
@@ -334,14 +334,119 @@ func (s *Syncer) skipUnavailableChannel(ctx context.Context, channel *discordgo.
 }
 
 func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channel *discordgo.Channel, full bool, embeddings bool) (int, error) {
-	scope := "channel:" + channel.ID + ":latest_message_id"
-	latest, err := s.store.GetSyncState(ctx, scope)
+	latestScope := channelLatestScope(channel.ID)
+	backfillScope := channelBackfillScope(channel.ID)
+	completeScope := channelHistoryCompleteScope(channel.ID)
+	latest, err := s.store.GetSyncState(ctx, latestScope)
+	if err != nil {
+		return 0, err
+	}
+	backfillCursor, err := s.store.GetSyncState(ctx, backfillScope)
+	if err != nil {
+		return 0, err
+	}
+	backfillComplete, err := s.store.GetSyncState(ctx, completeScope)
 	if err != nil {
 		return 0, err
 	}
 	messageCount := 0
 	newest := latest
-	if full || latest == "" {
+	if full {
+		if latest != "" {
+			after := latest
+			for {
+				page, err := s.client.ChannelMessages(ctx, channel.ID, 100, "", after)
+				if err != nil {
+					return messageCount, err
+				}
+				if len(page) == 0 {
+					break
+				}
+				mutations := make([]store.MessageMutation, 0, len(page))
+				for _, message := range page {
+					record := toMessageRecord(message, channel.Name)
+					mutations = append(mutations, store.MessageMutation{
+						Record:      record,
+						EventType:   "upsert",
+						PayloadJSON: record.RawJSON,
+						Options: store.WriteOptions{
+							EnqueueEmbedding: embeddings,
+						},
+					})
+					after = maxSnowflake(after, message.ID)
+					newest = maxSnowflake(newest, message.ID)
+					messageCount++
+				}
+				if err := s.store.UpsertMessages(ctx, mutations); err != nil {
+					return messageCount, err
+				}
+				if err := s.store.SetSyncState(ctx, latestScope, newest); err != nil {
+					return messageCount, err
+				}
+				if len(page) < 100 {
+					break
+				}
+			}
+		}
+		if backfillComplete == "" {
+			before := backfillCursor
+			if before == "" && latest != "" {
+				before = latest
+			}
+			for {
+				page, err := s.client.ChannelMessages(ctx, channel.ID, 100, before, "")
+				if err != nil {
+					return messageCount, err
+				}
+				if len(page) == 0 {
+					if err := s.store.SetSyncState(ctx, completeScope, "1"); err != nil {
+						return messageCount, err
+					}
+					break
+				}
+				mutations := make([]store.MessageMutation, 0, len(page))
+				if newest == "" {
+					newest = maxSnowflake(newest, page[0].ID)
+				}
+				for _, message := range page {
+					record := toMessageRecord(message, channel.Name)
+					mutations = append(mutations, store.MessageMutation{
+						Record:      record,
+						EventType:   "upsert",
+						PayloadJSON: record.RawJSON,
+						Options: store.WriteOptions{
+							EnqueueEmbedding: embeddings,
+						},
+					})
+					newest = maxSnowflake(newest, message.ID)
+					messageCount++
+				}
+				if err := s.store.UpsertMessages(ctx, mutations); err != nil {
+					return messageCount, err
+				}
+				if err := s.store.SetSyncState(ctx, latestScope, newest); err != nil {
+					return messageCount, err
+				}
+				before = page[len(page)-1].ID
+				if err := s.store.SetSyncState(ctx, backfillScope, before); err != nil {
+					return messageCount, err
+				}
+				if len(page) < 100 {
+					if err := s.store.SetSyncState(ctx, completeScope, "1"); err != nil {
+						return messageCount, err
+					}
+					break
+				}
+			}
+		}
+		if newest != "" || latest != "" || backfillComplete == "" {
+			if err := s.store.SetSyncState(ctx, latestScope, newest); err != nil {
+				return messageCount, err
+			}
+		}
+		return messageCount, nil
+	}
+	if latest == "" {
 		before := ""
 		for {
 			page, err := s.client.ChannelMessages(ctx, channel.ID, 100, before, "")
@@ -409,8 +514,8 @@ func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channe
 			}
 		}
 	}
-	if newest != "" || full || latest != "" {
-		if err := s.store.SetSyncState(ctx, scope, newest); err != nil {
+	if newest != "" || latest != "" {
+		if err := s.store.SetSyncState(ctx, latestScope, newest); err != nil {
 			return messageCount, err
 		}
 	}
@@ -472,6 +577,18 @@ func isUnknownChannel(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unknown channel") ||
 		(strings.Contains(msg, "http 404") && strings.Contains(msg, `"code": 10003`))
+}
+
+func channelLatestScope(channelID string) string {
+	return "channel:" + channelID + ":latest_message_id"
+}
+
+func channelBackfillScope(channelID string) string {
+	return "channel:" + channelID + ":backfill_before_id"
+}
+
+func channelHistoryCompleteScope(channelID string) string {
+	return "channel:" + channelID + ":history_complete"
 }
 
 func (s *Syncer) RunTail(ctx context.Context, guildIDs []string, repairEvery time.Duration) error {
