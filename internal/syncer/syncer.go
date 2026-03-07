@@ -322,12 +322,13 @@ func (s *Syncer) skipSyncError(ctx context.Context, channel *discordgo.Channel, 
 }
 
 func (s *Syncer) skipUnavailableChannel(ctx context.Context, channel *discordgo.Channel, err error) bool {
-	if !isMissingAccess(err) {
+	reason := unavailableReason(err)
+	if reason == "" {
 		return false
 	}
 	s.logger.Warn("channel message crawl skipped", "channel_id", channel.ID, "err", err)
 	if s.store != nil {
-		_ = s.store.SetSyncState(ctx, "channel:"+channel.ID+":unavailable", "missing_access")
+		_ = s.store.SetSyncState(ctx, "channel:"+channel.ID+":unavailable", reason)
 	}
 	return true
 }
@@ -451,6 +452,26 @@ func isRetryableSyncError(ctx context.Context, err error) bool {
 	default:
 		return false
 	}
+}
+
+func unavailableReason(err error) string {
+	switch {
+	case isMissingAccess(err):
+		return "missing_access"
+	case isUnknownChannel(err):
+		return "unknown_channel"
+	default:
+		return ""
+	}
+}
+
+func isUnknownChannel(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown channel") ||
+		(strings.Contains(msg, "http 404") && strings.Contains(msg, `"code": 10003`))
 }
 
 func (s *Syncer) RunTail(ctx context.Context, guildIDs []string, repairEvery time.Duration) error {

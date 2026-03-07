@@ -329,6 +329,43 @@ func TestSyncSkipsMissingAccessChannels(t *testing.T) {
 	require.Equal(t, "missing_access", cursor)
 }
 
+func TestSyncSkipsUnknownChannels(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		channels: map[string][]*discordgo.Channel{
+			"g1": {
+				{ID: "c1", GuildID: "g1", Name: "general", Type: discordgo.ChannelTypeGuildText},
+				{ID: "c2", GuildID: "g1", Name: "gone", Type: discordgo.ChannelTypeGuildText},
+			},
+		},
+		messages: map[string][]*discordgo.Message{
+			"c1": {{ID: "10", GuildID: "g1", ChannelID: "c1", Content: "ok", Timestamp: time.Now().UTC(), Author: &discordgo.User{ID: "u1", Username: "user"}}},
+		},
+		messageErrors: map[string]error{
+			"c2": fmt.Errorf("HTTP 404 Not Found, {\"message\": \"Unknown Channel\", \"code\": 10003}"),
+		},
+	}
+
+	svc := New(client, s, nil)
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true, Concurrency: 2})
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Messages)
+
+	cursor, err := s.GetSyncState(ctx, "channel:c2:unavailable")
+	require.NoError(t, err)
+	require.Equal(t, "unknown_channel", cursor)
+}
+
 func TestSyncSkipsRetryableChannelErrors(t *testing.T) {
 	t.Parallel()
 
@@ -563,6 +600,10 @@ func TestHelpers(t *testing.T) {
 	require.True(t, isMissingAccess(fmt.Errorf("HTTP 403 Forbidden")))
 	require.True(t, isMissingAccess(fmt.Errorf("Missing Access")))
 	require.False(t, isMissingAccess(fmt.Errorf("boom")))
+	require.Equal(t, "missing_access", unavailableReason(fmt.Errorf("HTTP 403 Forbidden")))
+	require.Equal(t, "unknown_channel", unavailableReason(fmt.Errorf("HTTP 404 Not Found, {\"message\": \"Unknown Channel\", \"code\": 10003}")))
+	require.True(t, isUnknownChannel(fmt.Errorf("Unknown Channel")))
+	require.False(t, isUnknownChannel(fmt.Errorf("boom")))
 	require.True(t, isRetryableSyncError(context.Background(), context.DeadlineExceeded))
 	require.True(t, isRetryableSyncError(context.Background(), fmt.Errorf("HTTP 503 Service Unavailable")))
 	require.True(t, isRetryableSyncError(context.Background(), fmt.Errorf("stream error: stream ID 1; INTERNAL_ERROR")))
