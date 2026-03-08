@@ -148,10 +148,10 @@ func TestHelpers(t *testing.T) {
 	})
 	require.Equal(t, []string{"a", "c", "b"}, []string{sorted[0].ID, sorted[1].ID, sorted[2].ID})
 
-	selected := selectStoredChannels([]store.ChannelRow{
+	selected := mapsToSlice(selectStoredChannels([]store.ChannelRow{
 		{ID: "c2", GuildID: "g1", Kind: "thread_private", Name: "thread", Position: 2, IsArchived: true, IsLocked: true, ArchiveTimestamp: time.Unix(10, 0).UTC()},
 		{ID: "c1", GuildID: "g1", Kind: "text", Name: "general", Position: 1},
-	}, []string{"c2", "c1"})
+	}, makeGuildSet([]string{"c2", "c1"})))
 	require.Len(t, selected, 2)
 	require.Equal(t, "c1", selected[0].ID)
 	require.Nil(t, selected[0].ThreadMetadata)

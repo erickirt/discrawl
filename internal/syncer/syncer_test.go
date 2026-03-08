@@ -25,6 +25,7 @@ type fakeClient struct {
 	members        map[string][]*discordgo.Member
 	messages       map[string][]*discordgo.Message
 	messageErrors  map[string]error
+	messageCalls   map[string]int
 	beforeErrors   map[string]map[string]error
 	tailCalls      int
 	messageDelay   time.Duration
@@ -72,6 +73,12 @@ func (f *fakeClient) GuildMembers(_ context.Context, guildID string) ([]*discord
 }
 
 func (f *fakeClient) ChannelMessages(_ context.Context, channelID string, limit int, beforeID, afterID string) ([]*discordgo.Message, error) {
+	f.mu.Lock()
+	if f.messageCalls == nil {
+		f.messageCalls = make(map[string]int)
+	}
+	f.messageCalls[channelID]++
+	f.mu.Unlock()
 	if err := f.messageErrors[channelID]; err != nil {
 		return nil, err
 	}

@@ -12,24 +12,73 @@ import (
 )
 
 func (s *Syncer) channelList(ctx context.Context, guildID string, requested []string) ([]*discordgo.Channel, bool, error) {
-	if len(requested) > 0 && s.store != nil {
+	if len(requested) == 0 {
+		channels, err := s.liveChannelList(ctx, guildID)
+		if err != nil {
+			return nil, false, err
+		}
+		return channels, false, nil
+	}
+
+	requestedSet := makeGuildSet(requested)
+	storedByID := map[string]*discordgo.Channel{}
+	if s.store != nil {
 		rows, err := s.store.Channels(ctx, guildID)
 		if err != nil {
 			return nil, false, err
 		}
-		if selected := selectStoredChannels(rows, requested); len(selected) > 0 {
+		storedByID = selectStoredChannels(rows, requestedSet)
+		if canUseStoredTargets(storedByID, requestedSet) {
+			selected := selectRequestedChannels(nil, storedByID, requestedSet)
 			return selected, true, nil
 		}
 	}
-	channels, err := s.client.GuildChannels(ctx, guildID)
+
+	topLevel, err := s.client.GuildChannels(ctx, guildID)
 	if err != nil {
 		return nil, false, fmt.Errorf("fetch channels for guild %s: %w", guildID, err)
+	}
+	allChannels := make(map[string]*discordgo.Channel, len(topLevel))
+	for _, channel := range topLevel {
+		allChannels[channel.ID] = channel
+	}
+
+	selected := selectRequestedChannels(allChannels, storedByID, requestedSet)
+	requestedForums := requestedForumParents(allChannels, requestedSet)
+	if len(requestedForums) > 0 {
+		if err := s.appendThreadCatalog(ctx, allChannels, setToSlice(requestedForums)); err != nil {
+			return nil, false, err
+		}
+		selected = selectRequestedChannels(allChannels, storedByID, requestedSet)
+	}
+
+	if unresolvedRequestedIDs(selected, requestedSet) > 0 {
+		if err := s.appendThreadCatalog(ctx, allChannels, threadParentIDs(topLevel)); err != nil {
+			return nil, false, err
+		}
+		selected = selectRequestedChannels(allChannels, storedByID, requestedSet)
+	}
+	return selected, true, nil
+}
+
+func (s *Syncer) liveChannelList(ctx context.Context, guildID string) ([]*discordgo.Channel, error) {
+	channels, err := s.client.GuildChannels(ctx, guildID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch channels for guild %s: %w", guildID, err)
 	}
 	allChannels := make(map[string]*discordgo.Channel, len(channels))
 	for _, channel := range channels {
 		allChannels[channel.ID] = channel
 	}
-	for _, channel := range channels {
+	if err := s.appendThreadCatalog(ctx, allChannels, threadParentIDs(channels)); err != nil {
+		return nil, err
+	}
+	return mapsToSlice(allChannels), nil
+}
+
+func (s *Syncer) appendThreadCatalog(ctx context.Context, allChannels map[string]*discordgo.Channel, parents []string) error {
+	for _, parentID := range uniqueIDs(parents) {
+		channel := allChannels[parentID]
 		if !isThreadParent(channel) {
 			continue
 		}
@@ -50,7 +99,7 @@ func (s *Syncer) channelList(ctx context.Context, guildID string, requested []st
 			}
 		}
 	}
-	return mapsToSlice(allChannels), false, nil
+	return nil
 }
 
 func mapsToSlice(in map[string]*discordgo.Channel) []*discordgo.Channel {
@@ -62,14 +111,13 @@ func mapsToSlice(in map[string]*discordgo.Channel) []*discordgo.Channel {
 	return out
 }
 
-func selectStoredChannels(rows []store.ChannelRow, requested []string) []*discordgo.Channel {
+func selectStoredChannels(rows []store.ChannelRow, requested map[string]struct{}) map[string]*discordgo.Channel {
 	if len(rows) == 0 || len(requested) == 0 {
 		return nil
 	}
-	set := makeGuildSet(requested)
-	out := make([]*discordgo.Channel, 0, len(requested))
+	out := make(map[string]*discordgo.Channel, len(requested))
 	for _, row := range rows {
-		if _, ok := set[row.ID]; !ok {
+		if _, ok := requested[row.ID]; !ok {
 			continue
 		}
 		channelType := channelTypeFromKind(row.Kind)
@@ -81,7 +129,7 @@ func selectStoredChannels(rows []store.ChannelRow, requested []string) []*discor
 				ArchiveTimestamp: row.ArchiveTimestamp,
 			}
 		}
-		out = append(out, &discordgo.Channel{
+		out[row.ID] = &discordgo.Channel{
 			ID:             row.ID,
 			GuildID:        row.GuildID,
 			ParentID:       row.ParentID,
@@ -91,10 +139,127 @@ func selectStoredChannels(rows []store.ChannelRow, requested []string) []*discor
 			NSFW:           row.IsNSFW,
 			Type:           channelType,
 			ThreadMetadata: threadMeta,
-		})
+		}
 	}
-	sortChannels(out)
 	return out
+}
+
+func canUseStoredTargets(storedByID map[string]*discordgo.Channel, requested map[string]struct{}) bool {
+	if len(requested) == 0 || len(storedByID) != len(requested) {
+		return false
+	}
+	for _, channel := range storedByID {
+		if channel != nil && channel.Type == discordgo.ChannelTypeGuildForum {
+			return false
+		}
+	}
+	return true
+}
+
+func selectRequestedChannels(liveByID, storedByID map[string]*discordgo.Channel, requested map[string]struct{}) []*discordgo.Channel {
+	if len(requested) == 0 {
+		return nil
+	}
+	selected := make(map[string]*discordgo.Channel, len(requested))
+	for requestedID := range requested {
+		if channel, ok := liveByID[requestedID]; ok {
+			selected[requestedID] = channel
+			continue
+		}
+		if channel, ok := storedByID[requestedID]; ok {
+			selected[requestedID] = channel
+		}
+	}
+	for forumID := range requestedForumParents(selected, requested) {
+		for _, channel := range liveByID {
+			if channel == nil || channel.ParentID != forumID || !isThreadChannel(channel) {
+				continue
+			}
+			selected[channel.ID] = channel
+		}
+	}
+	return mapsToSlice(selected)
+}
+
+func requestedForumParents(channels map[string]*discordgo.Channel, requested map[string]struct{}) map[string]struct{} {
+	if len(requested) == 0 {
+		return nil
+	}
+	parents := make(map[string]struct{})
+	for requestedID := range requested {
+		channel := channels[requestedID]
+		if channel != nil && channel.Type == discordgo.ChannelTypeGuildForum {
+			parents[requestedID] = struct{}{}
+		}
+	}
+	return parents
+}
+
+func setToSlice(in map[string]struct{}) []string {
+	out := make([]string, 0, len(in))
+	for id := range in {
+		out = append(out, id)
+	}
+	return out
+}
+
+func unresolvedRequestedIDs(selected []*discordgo.Channel, requested map[string]struct{}) int {
+	if len(requested) == 0 {
+		return 0
+	}
+	selectedIDs := make(map[string]struct{}, len(selected))
+	for _, channel := range selected {
+		if channel != nil {
+			selectedIDs[channel.ID] = struct{}{}
+		}
+	}
+	missing := 0
+	for requestedID := range requested {
+		if _, ok := selectedIDs[requestedID]; !ok {
+			missing++
+		}
+	}
+	return missing
+}
+
+func threadParentIDs(channels []*discordgo.Channel) []string {
+	parents := make([]string, 0, len(channels))
+	for _, channel := range channels {
+		if isThreadParent(channel) {
+			parents = append(parents, channel.ID)
+		}
+	}
+	return parents
+}
+
+func uniqueIDs(ids []string) []string {
+	set := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := set[id]; ok {
+			continue
+		}
+		set[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func isThreadChannel(channel *discordgo.Channel) bool {
+	if channel == nil {
+		return false
+	}
+	switch channel.Type {
+	case discordgo.ChannelTypeGuildPublicThread,
+		discordgo.ChannelTypeGuildPrivateThread,
+		discordgo.ChannelTypeGuildNewsThread:
+		return true
+	default:
+		return false
+	}
 }
 
 func sortChannels(channels []*discordgo.Channel) {

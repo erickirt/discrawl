@@ -3,7 +3,6 @@ package syncer
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
@@ -28,17 +27,41 @@ func (s *Syncer) syncMessageChannels(
 }
 
 func filterMessageChannels(channels []*discordgo.Channel, requested []string) []*discordgo.Channel {
+	requestedSet := makeGuildSet(requested)
+	channelByID := make(map[string]*discordgo.Channel, len(channels))
+	for _, channel := range channels {
+		if channel != nil {
+			channelByID[channel.ID] = channel
+		}
+	}
 	out := make([]*discordgo.Channel, 0, len(channels))
 	for _, channel := range channels {
 		if !isMessageChannel(channel) {
 			continue
 		}
-		if len(requested) > 0 && !slices.Contains(requested, channel.ID) {
+		if len(requestedSet) > 0 && !requestedMessageTarget(channel, channelByID, requestedSet) {
 			continue
 		}
 		out = append(out, channel)
 	}
 	return out
+}
+
+func requestedMessageTarget(channel *discordgo.Channel, channelByID map[string]*discordgo.Channel, requested map[string]struct{}) bool {
+	if channel == nil {
+		return false
+	}
+	if _, ok := requested[channel.ID]; ok {
+		return true
+	}
+	if !isThreadChannel(channel) {
+		return false
+	}
+	if _, ok := requested[channel.ParentID]; !ok {
+		return false
+	}
+	parent := channelByID[channel.ParentID]
+	return parent != nil && parent.Type == discordgo.ChannelTypeGuildForum
 }
 
 func (s *Syncer) syncMessageChannelsSerial(ctx context.Context, guildID string, channels []*discordgo.Channel, opts SyncOptions) (int, error) {
@@ -137,7 +160,13 @@ func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channe
 		if err := s.seedChannelSyncState(ctx, channel.ID, &state); err != nil {
 			return 0, err
 		}
+		if shouldSkipThreadSync(channel, state) {
+			return 0, nil
+		}
 		return s.syncFullChannelHistory(ctx, channel, state, embeddings)
+	}
+	if shouldSkipThreadSync(channel, state) {
+		return 0, nil
 	}
 	return s.syncIncrementalChannelHistory(ctx, channel, state, embeddings)
 }
@@ -147,6 +176,16 @@ type channelSyncState struct {
 	StoredLatest     string
 	BackfillCursor   string
 	BackfillComplete bool
+}
+
+func shouldSkipThreadSync(channel *discordgo.Channel, state channelSyncState) bool {
+	if !isThreadChannel(channel) || !state.BackfillComplete {
+		return false
+	}
+	if channel == nil || channel.LastMessageID == "" || state.Latest == "" {
+		return false
+	}
+	return maxSnowflake(state.Latest, channel.LastMessageID) == state.Latest
 }
 
 func (s *Syncer) loadChannelSyncState(ctx context.Context, channelID string) (channelSyncState, error) {
