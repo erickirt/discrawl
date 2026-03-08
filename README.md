@@ -1,4 +1,4 @@
-# discrawl
+# discrawl 🛰️ — Mirror Discord into SQLite; search server history locally
 
 `discrawl` mirrors Discord guild data into local SQLite so you can search, inspect, and query server history without depending on Discord search.
 
