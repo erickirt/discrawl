@@ -3,6 +3,7 @@ package syncer
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -188,7 +189,7 @@ func fetchAttachmentText(ctx context.Context, url string) (string, error) {
 	}
 	reader := bufio.NewReader(resp.Body)
 	peek, err := reader.Peek(512)
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
 	if len(peek) != 0 && !isAllowedFetchedContentType(normalizedMediaType(http.DetectContentType(peek))) {

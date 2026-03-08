@@ -141,6 +141,33 @@ func TestReadOnlyQueryGuards(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestQueryAndExec(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	affected, err := s.Exec(ctx, `
+		insert into sync_state(scope, cursor, updated_at)
+		values('scope:test-exec', 'cursor-1', '2026-03-08T00:00:00Z')
+	`)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected)
+
+	cols, rows, err := s.Query(ctx, `select scope, cursor from sync_state where scope = 'scope:test-exec'`)
+	require.NoError(t, err)
+	require.Equal(t, []string{"scope", "cursor"}, cols)
+	require.Equal(t, [][]string{{"scope:test-exec", "cursor-1"}}, rows)
+
+	_, _, err = s.Query(ctx, "   ")
+	require.Error(t, err)
+
+	_, err = s.Exec(ctx, "   ")
+	require.Error(t, err)
+}
+
 func TestUpsertAndDeleteMember(t *testing.T) {
 	t.Parallel()
 

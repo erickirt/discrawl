@@ -264,6 +264,16 @@ func TestSyncUsesConfiguredConcurrency(t *testing.T) {
 	require.GreaterOrEqual(t, maxInFlight, 2)
 }
 
+func TestSetAttachmentTextEnabled(t *testing.T) {
+	t.Parallel()
+
+	svc := New(&fakeClient{}, nil, nil)
+	require.True(t, svc.attachmentTextEnabled)
+
+	svc.SetAttachmentTextEnabled(false)
+	require.False(t, svc.attachmentTextEnabled)
+}
+
 func TestSyncChannelSubsetUsesStoredMetadata(t *testing.T) {
 	t.Parallel()
 
