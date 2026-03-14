@@ -52,6 +52,8 @@ type SyncStats struct {
 	Messages int `json:"messages"`
 }
 
+const fullSyncBatchSize = 25
+
 func New(client Client, store *store.Store, logger *slog.Logger) *Syncer {
 	if logger == nil {
 		logger = slog.Default()
@@ -112,6 +114,19 @@ func (s *Syncer) syncGuild(ctx context.Context, guildID string, opts SyncOptions
 	}
 
 	stats := SyncStats{}
+	if opts.Full && len(opts.ChannelIDs) == 0 {
+		batched, ok, err := s.syncGuildIncompleteBatches(ctx, guildID, opts)
+		if err != nil {
+			return stats, err
+		}
+		if ok {
+			stats.Members = s.refreshGuildMembers(ctx, guildID)
+			stats.Channels += batched.Channels
+			stats.Threads += batched.Threads
+			stats.Messages += batched.Messages
+			return stats, nil
+		}
+	}
 	channelList, targeted, err := s.channelList(ctx, guildID, opts.ChannelIDs)
 	if err != nil {
 		return stats, err
@@ -129,19 +144,7 @@ func (s *Syncer) syncGuild(ctx context.Context, guildID string, opts SyncOptions
 	}
 
 	if !targeted {
-		members, err := s.client.GuildMembers(ctx, guildID)
-		if err == nil {
-			converted := make([]store.MemberRecord, 0, len(members))
-			for _, member := range members {
-				converted = append(converted, toMemberRecord(guildID, member))
-			}
-			if err := s.store.ReplaceMembers(ctx, guildID, converted); err != nil {
-				return stats, err
-			}
-			stats.Members = len(converted)
-		} else {
-			s.logger.Warn("member crawl failed", "guild_id", guildID, "err", err)
-		}
+		stats.Members = s.refreshGuildMembers(ctx, guildID)
 	}
 
 	for _, channel := range channelList {
@@ -158,4 +161,51 @@ func (s *Syncer) syncGuild(ctx context.Context, guildID string, opts SyncOptions
 	}
 	stats.Messages += messageCount
 	return stats, nil
+}
+
+func (s *Syncer) syncGuildIncompleteBatches(ctx context.Context, guildID string, opts SyncOptions) (SyncStats, bool, error) {
+	if s.store == nil {
+		return SyncStats{}, false, nil
+	}
+	incomplete, err := s.store.IncompleteMessageChannelIDs(ctx, guildID)
+	if err != nil {
+		return SyncStats{}, false, err
+	}
+	if len(incomplete) == 0 {
+		return SyncStats{}, false, nil
+	}
+	stats := SyncStats{}
+	for start := 0; start < len(incomplete); start += fullSyncBatchSize {
+		end := start + fullSyncBatchSize
+		if end > len(incomplete) {
+			end = len(incomplete)
+		}
+		batchOpts := opts
+		batchOpts.ChannelIDs = incomplete[start:end]
+		one, err := s.syncGuild(ctx, guildID, batchOpts)
+		if err != nil {
+			return stats, true, err
+		}
+		stats.Channels += one.Channels
+		stats.Threads += one.Threads
+		stats.Messages += one.Messages
+	}
+	return stats, true, nil
+}
+
+func (s *Syncer) refreshGuildMembers(ctx context.Context, guildID string) int {
+	members, err := s.client.GuildMembers(ctx, guildID)
+	if err != nil {
+		s.logger.Warn("member crawl failed", "guild_id", guildID, "err", err)
+		return 0
+	}
+	converted := make([]store.MemberRecord, 0, len(members))
+	for _, member := range members {
+		converted = append(converted, toMemberRecord(guildID, member))
+	}
+	if err := s.store.ReplaceMembers(ctx, guildID, converted); err != nil {
+		s.logger.Warn("member replace failed", "guild_id", guildID, "err", err)
+		return 0
+	}
+	return len(converted)
 }

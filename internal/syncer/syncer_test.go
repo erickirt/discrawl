@@ -264,6 +264,54 @@ func TestSyncUsesConfiguredConcurrency(t *testing.T) {
 	require.GreaterOrEqual(t, maxInFlight, 2)
 }
 
+func TestSyncFullAutoBatchesIncompleteStoredChannels(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	require.NoError(t, s.UpsertGuild(ctx, store.GuildRecord{ID: "g1", Name: "Guild", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, store.ChannelRecord{
+		ID:       "t1",
+		GuildID:  "g1",
+		ParentID: "f1",
+		Kind:     "thread_public",
+		Name:     "thread-1",
+		RawJSON:  `{"id":"t1"}`,
+	}))
+	require.NoError(t, s.UpsertChannel(ctx, store.ChannelRecord{
+		ID:       "t2",
+		GuildID:  "g1",
+		ParentID: "f1",
+		Kind:     "thread_public",
+		Name:     "thread-2",
+		RawJSON:  `{"id":"t2"}`,
+	}))
+
+	now := time.Now().UTC()
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		messages: map[string][]*discordgo.Message{
+			"t1": {{ID: "10", GuildID: "g1", ChannelID: "t1", Content: "first", Timestamp: now, Author: &discordgo.User{ID: "u1", Username: "user"}}},
+			"t2": {{ID: "20", GuildID: "g1", ChannelID: "t2", Content: "second", Timestamp: now, Author: &discordgo.User{ID: "u1", Username: "user"}}},
+		},
+	}
+
+	svc := New(client, s, nil)
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true, GuildIDs: []string{"g1"}})
+	require.NoError(t, err)
+	require.Equal(t, 2, stats.Messages)
+	require.Zero(t, client.guildChanCalls)
+	require.Zero(t, client.threadCalls)
+	require.Equal(t, 1, client.messageCalls["t1"])
+	require.Equal(t, 1, client.messageCalls["t2"])
+}
+
 func TestSetAttachmentTextEnabled(t *testing.T) {
 	t.Parallel()
 

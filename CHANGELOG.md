@@ -4,6 +4,7 @@ All notable changes to `discrawl` will be documented in this file.
 
 ## 0.2.0 - Unreleased
 
+- `sync --full` now auto-batches incomplete message channels from the local archive instead of stalling on large forum/thread catalogs
 - offline member-profile search via `member_fts`
 - `members search` now matches archived profile fields in addition to names
 - `members show` now accepts ids or queries and shows recent messages plus message stats when uniquely resolved

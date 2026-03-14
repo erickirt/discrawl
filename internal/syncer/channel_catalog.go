@@ -70,7 +70,21 @@ func (s *Syncer) liveChannelList(ctx context.Context, guildID string) ([]*discor
 	for _, channel := range channels {
 		allChannels[channel.ID] = channel
 	}
-	if err := s.appendThreadCatalog(ctx, allChannels, threadParentIDs(channels)); err != nil {
+	var storedRows []store.ChannelRow
+	if s.store != nil {
+		rows, err := s.store.Channels(ctx, guildID)
+		if err != nil {
+			return nil, err
+		}
+		storedRows = rows
+		mergeStoredThreadChannels(allChannels, rows)
+	}
+	parentIDs := fullSyncThreadParentIDs(channels, storedRows)
+	if len(storedThreadParentIDs(storedRows)) == 0 {
+		if err := s.appendThreadCatalog(ctx, allChannels, parentIDs); err != nil {
+			return nil, err
+		}
+	} else if err := s.appendActiveThreadCatalog(ctx, allChannels, parentIDs); err != nil {
 		return nil, err
 	}
 	return mapsToSlice(allChannels), nil
@@ -82,11 +96,8 @@ func (s *Syncer) appendThreadCatalog(ctx context.Context, allChannels map[string
 		if !isThreadParent(channel) {
 			continue
 		}
-		active, err := s.client.ThreadsActive(ctx, channel.ID)
-		if err == nil {
-			for _, thread := range active {
-				allChannels[thread.ID] = thread
-			}
+		if err := s.appendActiveThreads(ctx, allChannels, channel.ID); err != nil {
+			return err
 		}
 		for _, private := range []bool{false, true} {
 			archived, err := s.client.ThreadsArchived(ctx, channel.ID, private)
@@ -102,6 +113,30 @@ func (s *Syncer) appendThreadCatalog(ctx context.Context, allChannels map[string
 	return nil
 }
 
+func (s *Syncer) appendActiveThreadCatalog(ctx context.Context, allChannels map[string]*discordgo.Channel, parents []string) error {
+	for _, parentID := range uniqueIDs(parents) {
+		channel := allChannels[parentID]
+		if !isThreadParent(channel) {
+			continue
+		}
+		if err := s.appendActiveThreads(ctx, allChannels, channel.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Syncer) appendActiveThreads(ctx context.Context, allChannels map[string]*discordgo.Channel, channelID string) error {
+	active, err := s.client.ThreadsActive(ctx, channelID)
+	if err != nil {
+		return err
+	}
+	for _, thread := range active {
+		allChannels[thread.ID] = thread
+	}
+	return nil
+}
+
 func mapsToSlice(in map[string]*discordgo.Channel) []*discordgo.Channel {
 	out := make([]*discordgo.Channel, 0, len(in))
 	for _, channel := range in {
@@ -109,6 +144,18 @@ func mapsToSlice(in map[string]*discordgo.Channel) []*discordgo.Channel {
 	}
 	sortChannels(out)
 	return out
+}
+
+func mergeStoredThreadChannels(allChannels map[string]*discordgo.Channel, rows []store.ChannelRow) {
+	for _, row := range rows {
+		if !strings.HasPrefix(row.Kind, "thread_") {
+			continue
+		}
+		if _, ok := allChannels[row.ID]; ok {
+			continue
+		}
+		allChannels[row.ID] = channelFromRow(row)
+	}
 }
 
 func selectStoredChannels(rows []store.ChannelRow, requested map[string]struct{}) map[string]*discordgo.Channel {
@@ -120,28 +167,32 @@ func selectStoredChannels(rows []store.ChannelRow, requested map[string]struct{}
 		if _, ok := requested[row.ID]; !ok {
 			continue
 		}
-		channelType := channelTypeFromKind(row.Kind)
-		var threadMeta *discordgo.ThreadMetadata
-		if strings.HasPrefix(row.Kind, "thread_") {
-			threadMeta = &discordgo.ThreadMetadata{
-				Archived:         row.IsArchived,
-				Locked:           row.IsLocked,
-				ArchiveTimestamp: row.ArchiveTimestamp,
-			}
-		}
-		out[row.ID] = &discordgo.Channel{
-			ID:             row.ID,
-			GuildID:        row.GuildID,
-			ParentID:       row.ParentID,
-			Name:           row.Name,
-			Topic:          row.Topic,
-			Position:       row.Position,
-			NSFW:           row.IsNSFW,
-			Type:           channelType,
-			ThreadMetadata: threadMeta,
-		}
+		out[row.ID] = channelFromRow(row)
 	}
 	return out
+}
+
+func channelFromRow(row store.ChannelRow) *discordgo.Channel {
+	channelType := channelTypeFromKind(row.Kind)
+	var threadMeta *discordgo.ThreadMetadata
+	if strings.HasPrefix(row.Kind, "thread_") {
+		threadMeta = &discordgo.ThreadMetadata{
+			Archived:         row.IsArchived,
+			Locked:           row.IsLocked,
+			ArchiveTimestamp: row.ArchiveTimestamp,
+		}
+	}
+	return &discordgo.Channel{
+		ID:             row.ID,
+		GuildID:        row.GuildID,
+		ParentID:       row.ParentID,
+		Name:           row.Name,
+		Topic:          row.Topic,
+		Position:       row.Position,
+		NSFW:           row.IsNSFW,
+		Type:           channelType,
+		ThreadMetadata: threadMeta,
+	}
 }
 
 func canUseStoredTargets(storedByID map[string]*discordgo.Channel, requested map[string]struct{}) bool {
@@ -228,6 +279,41 @@ func threadParentIDs(channels []*discordgo.Channel) []string {
 		if isThreadParent(channel) {
 			parents = append(parents, channel.ID)
 		}
+	}
+	return parents
+}
+
+func fullSyncThreadParentIDs(topLevel []*discordgo.Channel, storedRows []store.ChannelRow) []string {
+	storedParents := storedThreadParentIDs(storedRows)
+	if len(storedParents) == 0 {
+		return threadParentIDs(topLevel)
+	}
+	parents := make([]string, 0, len(topLevel))
+	for _, channel := range topLevel {
+		if channel == nil {
+			continue
+		}
+		if channel.Type == discordgo.ChannelTypeGuildForum {
+			parents = append(parents, channel.ID)
+			continue
+		}
+		if _, ok := storedParents[channel.ID]; ok && isThreadParent(channel) {
+			parents = append(parents, channel.ID)
+		}
+	}
+	return uniqueIDs(parents)
+}
+
+func storedThreadParentIDs(rows []store.ChannelRow) map[string]struct{} {
+	if len(rows) == 0 {
+		return nil
+	}
+	parents := make(map[string]struct{})
+	for _, row := range rows {
+		if !strings.HasPrefix(row.Kind, "thread_") || row.ParentID == "" {
+			continue
+		}
+		parents[row.ParentID] = struct{}{}
 	}
 	return parents
 }

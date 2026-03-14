@@ -241,6 +241,46 @@ func (s *Store) Channels(ctx context.Context, guildID string) ([]ChannelRow, err
 	return out, rows.Err()
 }
 
+func (s *Store) IncompleteMessageChannelIDs(ctx context.Context, guildID string) ([]string, error) {
+	args := []any{}
+	query := `
+		select c.id
+		from channels c
+		where c.kind in ('text', 'news', 'announcement', 'thread_public', 'thread_private', 'thread_news', 'thread_announcement')
+	`
+	if guildID != "" {
+		query += ` and c.guild_id = ?`
+		args = append(args, guildID)
+	}
+	query += `
+		and not exists (
+			select 1
+			from sync_state s
+			where s.scope = 'channel:' || c.id || ':history_complete'
+		)
+		and not exists (
+			select 1
+			from sync_state s
+			where s.scope = 'channel:' || c.id || ':unavailable'
+		)
+		order by c.id
+	`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Status(ctx context.Context, dbPath, defaultGuildID string) (Status, error) {
 	status := Status{DBPath: dbPath, DefaultGuildID: defaultGuildID}
 	queries := map[string]*int{
