@@ -26,6 +26,13 @@ func TestClientRESTWrappers(t *testing.T) {
 	mux.HandleFunc("/api/v10/guilds/g1/channels", writeJSON([]map[string]any{
 		{"id": "c1", "guild_id": "g1", "name": "general", "type": 0},
 	}))
+	mux.HandleFunc("/api/v10/guilds/g1/threads/active", writeJSON(map[string]any{
+		"threads": []map[string]any{
+			{"id": "tg1", "guild_id": "g1", "parent_id": "c1", "name": "guild-thread", "type": 11},
+		},
+		"members":  []any{},
+		"has_more": false,
+	}))
 	mux.HandleFunc("/api/v10/guilds/g1/members", writeJSON([]map[string]any{
 		{
 			"guild_id": "g1",
@@ -132,6 +139,10 @@ func TestClientRESTWrappers(t *testing.T) {
 	active, err := client.ThreadsActive(ctx, "c1")
 	require.NoError(t, err)
 	require.Len(t, active, 1)
+
+	guildActive, err := client.GuildThreadsActive(ctx, "g1")
+	require.NoError(t, err)
+	require.Len(t, guildActive, 1)
 
 	publicArchived, err := client.ThreadsArchived(ctx, "c1", false)
 	require.NoError(t, err)

@@ -313,6 +313,32 @@ func TestEventsSyncStateAndHelpers(t *testing.T) {
 	require.False(t, IsReadOnlySQL("delete from messages"))
 }
 
+func TestIncompleteMessageChannelIDs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "c1", GuildID: "g1", Kind: "text", Name: "general", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "c2", GuildID: "g1", Kind: "thread_public", Name: "thread", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "c3", GuildID: "g1", Kind: "text", Name: "restricted", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "c4", GuildID: "g2", Kind: "text", Name: "other", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: "v1", GuildID: "g1", Kind: "voice", Name: "voice", RawJSON: `{}`}))
+
+	require.NoError(t, s.SetSyncState(ctx, "channel:c2:history_complete", "1"))
+	require.NoError(t, s.SetSyncState(ctx, "channel:c3:unavailable", "missing_access"))
+
+	ids, err := s.IncompleteMessageChannelIDs(ctx, "g1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"c1"}, ids)
+
+	ids, err = s.IncompleteMessageChannelIDs(ctx, "")
+	require.NoError(t, err)
+	require.Equal(t, []string{"c1", "c4"}, ids)
+}
+
 func TestListMessagesFiltersAndLimit(t *testing.T) {
 	t.Parallel()
 
