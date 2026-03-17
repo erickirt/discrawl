@@ -468,6 +468,11 @@ func (s *Store) SetSyncState(ctx context.Context, scope, cursor string) error {
 	return err
 }
 
+func (s *Store) DeleteSyncState(ctx context.Context, scope string) error {
+	_, err := s.db.ExecContext(ctx, `delete from sync_state where scope = ?`, scope)
+	return err
+}
+
 func rollback(tx *sql.Tx) {
 	if tx != nil {
 		_ = tx.Rollback()

@@ -75,6 +75,9 @@ func (s *Syncer) syncMessageChannelsSerial(ctx context.Context, guildID string, 
 			}
 			return total, fmt.Errorf("sync channel %s: %w", channel.ID, err)
 		}
+		if err := s.clearUnavailableChannel(ctx, channel.ID); err != nil {
+			return total, err
+		}
 	}
 	return total, nil
 }
@@ -108,8 +111,12 @@ func (s *Syncer) syncMessageChannelsConcurrent(
 					return
 				}
 				count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full, opts.Embeddings)
+				succeeded := err == nil
 				if err != nil && s.skipSyncError(ctx, channel, err) {
 					err = nil
+				}
+				if succeeded {
+					err = s.clearUnavailableChannel(ctx, channel.ID)
 				}
 				select {
 				case results <- result{channelID: channel.ID, count: count, err: err}:
@@ -149,6 +156,13 @@ func (s *Syncer) syncMessageChannelsConcurrent(
 		}
 	}
 	return total, firstErr
+}
+
+func (s *Syncer) clearUnavailableChannel(ctx context.Context, channelID string) error {
+	if s.store == nil || channelID == "" {
+		return nil
+	}
+	return s.store.DeleteSyncState(ctx, "channel:"+channelID+":unavailable")
 }
 
 func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channel *discordgo.Channel, full bool, embeddings bool) (int, error) {

@@ -277,6 +277,11 @@ func TestEventsSyncStateAndHelpers(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "cursor-1", cursor)
 
+	require.NoError(t, s.DeleteSyncState(ctx, "scope:test"))
+	cursor, err = s.GetSyncState(ctx, "scope:test")
+	require.NoError(t, err)
+	require.Empty(t, cursor)
+
 	_, rows, err := s.ReadOnlyQuery(ctx, "select deleted_at from messages where id = 'm1'")
 	require.NoError(t, err)
 	require.NotEmpty(t, rows)
