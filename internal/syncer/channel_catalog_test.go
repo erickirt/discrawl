@@ -187,6 +187,48 @@ func TestSyncSkipsUnchangedThreadsWhenHistoryComplete(t *testing.T) {
 	require.Zero(t, client.messageCalls["t1"])
 }
 
+func TestSyncSkipsUnchangedTextChannelsWhenHistoryComplete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	require.NoError(t, s.UpsertGuild(ctx, store.GuildRecord{ID: "g1", Name: "Guild", RawJSON: `{}`}))
+	require.NoError(t, s.UpsertChannel(ctx, store.ChannelRecord{
+		ID:      "c1",
+		GuildID: "g1",
+		Kind:    "text",
+		Name:    "general",
+		RawJSON: `{"id":"c1"}`,
+	}))
+	require.NoError(t, s.SetSyncState(ctx, channelLatestScope("c1"), "200"))
+	require.NoError(t, s.SetSyncState(ctx, channelHistoryCompleteScope("c1"), "1"))
+
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		channels: map[string][]*discordgo.Channel{
+			"g1": {{
+				ID:            "c1",
+				GuildID:       "g1",
+				Name:          "general",
+				Type:          discordgo.ChannelTypeGuildText,
+				LastMessageID: "200",
+			}},
+		},
+	}
+
+	svc := New(client, s, nil)
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true, GuildIDs: []string{"g1"}})
+	require.NoError(t, err)
+	require.Zero(t, stats.Messages)
+	require.Zero(t, client.messageCalls["c1"])
+}
+
 func TestFullSyncReusesStoredThreadParents(t *testing.T) {
 	t.Parallel()
 

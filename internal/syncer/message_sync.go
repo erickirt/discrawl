@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/steipete/discrawl/internal/store"
@@ -19,11 +20,12 @@ func (s *Syncer) syncMessageChannels(
 	if len(messageChannels) == 0 {
 		return 0, nil
 	}
+	progress := newMessageSyncProgress(s, guildID, len(messageChannels), opts)
 	workers := opts.Concurrency
 	if workers <= 1 {
-		return s.syncMessageChannelsSerial(ctx, guildID, messageChannels, opts)
+		return s.syncMessageChannelsSerial(ctx, guildID, messageChannels, opts, progress)
 	}
-	return s.syncMessageChannelsConcurrent(ctx, guildID, messageChannels, opts, workers)
+	return s.syncMessageChannelsConcurrent(ctx, guildID, messageChannels, opts, workers, progress)
 }
 
 func filterMessageChannels(channels []*discordgo.Channel, requested []string) []*discordgo.Channel {
@@ -64,7 +66,7 @@ func requestedMessageTarget(channel *discordgo.Channel, channelByID map[string]*
 	return parent != nil && parent.Type == discordgo.ChannelTypeGuildForum
 }
 
-func (s *Syncer) syncMessageChannelsSerial(ctx context.Context, guildID string, channels []*discordgo.Channel, opts SyncOptions) (int, error) {
+func (s *Syncer) syncMessageChannelsSerial(ctx context.Context, guildID string, channels []*discordgo.Channel, opts SyncOptions, progress *messageSyncProgress) (int, error) {
 	total := 0
 	for _, channel := range channels {
 		count, err := s.syncChannelMessages(ctx, guildID, channel, opts.Full, opts.Embeddings)
@@ -78,6 +80,7 @@ func (s *Syncer) syncMessageChannelsSerial(ctx context.Context, guildID string, 
 		if err := s.clearUnavailableChannel(ctx, channel.ID); err != nil {
 			return total, err
 		}
+		progress.record(channel, count)
 	}
 	return total, nil
 }
@@ -88,9 +91,11 @@ func (s *Syncer) syncMessageChannelsConcurrent(
 	channels []*discordgo.Channel,
 	opts SyncOptions,
 	workers int,
+	progress *messageSyncProgress,
 ) (int, error) {
 	type result struct {
 		channelID string
+		channel   *discordgo.Channel
 		count     int
 		err       error
 	}
@@ -119,7 +124,7 @@ func (s *Syncer) syncMessageChannelsConcurrent(
 					err = s.clearUnavailableChannel(ctx, channel.ID)
 				}
 				select {
-				case results <- result{channelID: channel.ID, count: count, err: err}:
+				case results <- result{channelID: channel.ID, channel: channel, count: count, err: err}:
 				case <-ctx.Done():
 					return
 				}
@@ -151,6 +156,7 @@ func (s *Syncer) syncMessageChannelsConcurrent(
 	var firstErr error
 	for result := range results {
 		total += result.count
+		progress.record(result.channel, result.count)
 		if result.err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("sync channel %s: %w", result.channelID, result.err)
 		}
@@ -174,12 +180,12 @@ func (s *Syncer) syncChannelMessages(ctx context.Context, guildID string, channe
 		if err := s.seedChannelSyncState(ctx, channel.ID, &state); err != nil {
 			return 0, err
 		}
-		if shouldSkipThreadSync(channel, state) {
+		if shouldSkipChannelSync(channel, state) {
 			return 0, nil
 		}
 		return s.syncFullChannelHistory(ctx, channel, state, embeddings)
 	}
-	if shouldSkipThreadSync(channel, state) {
+	if shouldSkipChannelSync(channel, state) {
 		return 0, nil
 	}
 	return s.syncIncrementalChannelHistory(ctx, channel, state, embeddings)
@@ -192,11 +198,14 @@ type channelSyncState struct {
 	BackfillComplete bool
 }
 
-func shouldSkipThreadSync(channel *discordgo.Channel, state channelSyncState) bool {
-	if !isThreadChannel(channel) || !state.BackfillComplete {
+func shouldSkipChannelSync(channel *discordgo.Channel, state channelSyncState) bool {
+	if !state.BackfillComplete || channel == nil {
 		return false
 	}
-	if channel == nil || channel.LastMessageID == "" || state.Latest == "" {
+	if channel.LastMessageID == "" {
+		return state.Latest == ""
+	}
+	if state.Latest == "" {
 		return false
 	}
 	return maxSnowflake(state.Latest, channel.LastMessageID) == state.Latest
@@ -417,4 +426,69 @@ func buildMessageMutations(ctx context.Context, messages []*discordgo.Message, c
 		newest = maxSnowflake(newest, message.ID)
 	}
 	return mutations, newest, nil
+}
+
+type messageSyncProgress struct {
+	syncer        *Syncer
+	guildID       string
+	totalChannels int
+	startedAt     time.Time
+	lastLogAt     time.Time
+	processed     int
+	messages      int
+}
+
+func newMessageSyncProgress(s *Syncer, guildID string, totalChannels int, opts SyncOptions) *messageSyncProgress {
+	if s == nil || s.logger == nil || totalChannels == 0 {
+		return nil
+	}
+	progress := &messageSyncProgress{
+		syncer:        s,
+		guildID:       guildID,
+		totalChannels: totalChannels,
+		startedAt:     time.Now(),
+		lastLogAt:     time.Now(),
+	}
+	s.logger.Info(
+		"message sync started",
+		"guild_id", guildID,
+		"channels", totalChannels,
+		"full", opts.Full,
+		"concurrency", max(1, opts.Concurrency),
+	)
+	return progress
+}
+
+func (p *messageSyncProgress) record(channel *discordgo.Channel, count int) {
+	if p == nil || p.syncer == nil || p.syncer.logger == nil {
+		return
+	}
+	p.processed++
+	p.messages += count
+	now := time.Now()
+	shouldLog := p.processed == p.totalChannels ||
+		p.processed == 1 ||
+		p.processed%100 == 0 ||
+		now.Sub(p.lastLogAt) >= 15*time.Second
+	if !shouldLog {
+		return
+	}
+	p.lastLogAt = now
+	channelID := ""
+	channelName := ""
+	if channel != nil {
+		channelID = channel.ID
+		channelName = channel.Name
+	}
+	p.syncer.logger.Info(
+		"message sync progress",
+		"guild_id", p.guildID,
+		"processed_channels", p.processed,
+		"total_channels", p.totalChannels,
+		"remaining_channels", p.totalChannels-p.processed,
+		"messages_written", p.messages,
+		"last_channel_id", channelID,
+		"last_channel_name", channelName,
+		"elapsed", now.Sub(p.startedAt).Round(time.Second).String(),
+	)
 }

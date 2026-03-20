@@ -151,6 +151,7 @@ bin/discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z
 
 `sync` already uses parallel channel workers. `--concurrency` overrides the default, and the default is auto-sized from `GOMAXPROCS` with a floor of `8` and a cap of `32`.
 When `--channels` includes a forum channel id, `discrawl` expands that forum's threads and syncs their messages as part of the targeted run.
+Long runs now emit periodic progress logs to stderr so large backfills do not look hung.
 
 ### `tail`
 
