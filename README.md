@@ -153,6 +153,7 @@ bin/discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z
 When `--channels` includes a forum channel id, `discrawl` expands that forum's threads and syncs their messages as part of the targeted run.
 `--since` limits initial history/bootstrap and full-history backfill to messages at or after the given RFC3339 timestamp. It does not mark older history as complete, so a later `sync --full` without `--since` can continue the backfill.
 Long runs now emit periodic progress logs to stderr so large backfills do not look hung.
+Full sync member refresh is best-effort and currently gives up after two minutes without a caller-supplied deadline, so message sync completion is not held hostage by a slow guild member crawl.
 
 ### `tail`
 

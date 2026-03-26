@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -33,6 +34,7 @@ type Syncer struct {
 	store                 *store.Store
 	logger                *slog.Logger
 	attachmentTextEnabled bool
+	memberRefreshTimeout  time.Duration
 }
 
 type SyncOptions struct {
@@ -54,6 +56,7 @@ type SyncStats struct {
 }
 
 const fullSyncBatchSize = 25
+const defaultMemberRefreshTimeout = 2 * time.Minute
 
 func New(client Client, store *store.Store, logger *slog.Logger) *Syncer {
 	if logger == nil {
@@ -64,6 +67,7 @@ func New(client Client, store *store.Store, logger *slog.Logger) *Syncer {
 		store:                 store,
 		logger:                logger,
 		attachmentTextEnabled: true,
+		memberRefreshTimeout:  defaultMemberRefreshTimeout,
 	}
 }
 
@@ -195,9 +199,29 @@ func (s *Syncer) syncGuildIncompleteBatches(ctx context.Context, guildID string,
 }
 
 func (s *Syncer) refreshGuildMembers(ctx context.Context, guildID string) int {
-	members, err := s.client.GuildMembers(ctx, guildID)
+	memberCtx := ctx
+	cancel := func() {}
+	if s.memberRefreshTimeout > 0 {
+		if _, ok := ctx.Deadline(); !ok {
+			memberCtx, cancel = context.WithTimeout(ctx, s.memberRefreshTimeout)
+		}
+	}
+	defer cancel()
+	startedAt := time.Now()
+	s.logger.Info(
+		"member sync started",
+		"guild_id", guildID,
+		"timeout", timeoutLabel(s.memberRefreshTimeout),
+	)
+	members, err := s.client.GuildMembers(memberCtx, guildID)
 	if err != nil {
-		s.logger.Warn("member crawl failed", "guild_id", guildID, "err", err)
+		s.logger.Warn(
+			"member crawl failed",
+			"guild_id", guildID,
+			"err", err,
+			"elapsed", time.Since(startedAt).Round(time.Second).String(),
+			"timed_out", errors.Is(err, context.DeadlineExceeded),
+		)
 		return 0
 	}
 	converted := make([]store.MemberRecord, 0, len(members))
@@ -208,5 +232,18 @@ func (s *Syncer) refreshGuildMembers(ctx context.Context, guildID string) int {
 		s.logger.Warn("member replace failed", "guild_id", guildID, "err", err)
 		return 0
 	}
+	s.logger.Info(
+		"member sync completed",
+		"guild_id", guildID,
+		"members", len(converted),
+		"elapsed", time.Since(startedAt).Round(time.Second).String(),
+	)
 	return len(converted)
+}
+
+func timeoutLabel(d time.Duration) string {
+	if d <= 0 {
+		return "none"
+	}
+	return d.String()
 }

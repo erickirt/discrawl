@@ -28,6 +28,7 @@ type fakeClient struct {
 	messageErrors    map[string]error
 	messageCalls     map[string]int
 	beforeErrors     map[string]map[string]error
+	memberDelay      time.Duration
 	tailCalls        int
 	messageDelay     time.Duration
 	guildChanCalls   int
@@ -81,8 +82,17 @@ func (f *fakeClient) ThreadsArchived(_ context.Context, channelID string, privat
 	return f.publicArchived[channelID], nil
 }
 
-func (f *fakeClient) GuildMembers(_ context.Context, guildID string) ([]*discordgo.Member, error) {
+func (f *fakeClient) GuildMembers(ctx context.Context, guildID string) ([]*discordgo.Member, error) {
 	f.memberCalls++
+	if f.memberDelay > 0 {
+		timer := time.NewTimer(f.memberDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	return f.members[guildID], nil
 }
 
@@ -276,6 +286,52 @@ func TestSyncUsesConfiguredConcurrency(t *testing.T) {
 	maxInFlight := client.maxInFlight
 	client.mu.Unlock()
 	require.GreaterOrEqual(t, maxInFlight, 2)
+}
+
+func TestSyncMemberRefreshTimeoutStillMarksSuccess(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "discrawl.db")
+	s, err := store.Open(ctx, dbPath)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	client := &fakeClient{
+		guilds: []*discordgo.UserGuild{{ID: "g1", Name: "Guild"}},
+		guildByID: map[string]*discordgo.Guild{
+			"g1": {ID: "g1", Name: "Guild"},
+		},
+		channels: map[string][]*discordgo.Channel{
+			"g1": {
+				{ID: "c1", GuildID: "g1", Name: "general", Type: discordgo.ChannelTypeGuildText},
+			},
+		},
+		messages: map[string][]*discordgo.Message{
+			"c1": {{
+				ID:        "100",
+				GuildID:   "g1",
+				ChannelID: "c1",
+				Content:   "hello",
+				Timestamp: time.Now().UTC(),
+				Author:    &discordgo.User{ID: "u1", Username: "peter"},
+			}},
+		},
+		memberDelay: 100 * time.Millisecond,
+	}
+
+	svc := New(client, s, nil)
+	svc.memberRefreshTimeout = 10 * time.Millisecond
+
+	stats, err := svc.Sync(ctx, SyncOptions{Full: true})
+	require.NoError(t, err)
+	require.Equal(t, 0, stats.Members)
+	require.Equal(t, 1, stats.Messages)
+	require.Equal(t, 1, client.memberCalls)
+
+	lastSync, err := s.GetSyncState(ctx, "sync:last_success")
+	require.NoError(t, err)
+	require.NotEmpty(t, lastSync)
 }
 
 func TestSyncFullAutoBatchesIncompleteStoredChannels(t *testing.T) {
