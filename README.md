@@ -55,8 +55,8 @@ Fastest env-only path:
 
 ```bash
 export DISCORD_BOT_TOKEN="your-bot-token"
-bin/discrawl doctor
-bin/discrawl init
+discrawl doctor
+discrawl init
 ```
 
 If you keep shell secrets in `~/.profile`, add:
@@ -78,6 +78,13 @@ Default runtime paths:
 
 ## Install
 
+Homebrew (recommended):
+
+```bash
+brew install steipete/tap/discrawl  # auto-taps steipete/tap
+discrawl --version
+```
+
 Build from source:
 
 ```bash
@@ -87,32 +94,27 @@ go build -o bin/discrawl ./cmd/discrawl
 ./bin/discrawl --version
 ```
 
-Homebrew tap:
-
-```bash
-brew tap steipete/tap
-brew install steipete/tap/discrawl
-```
+Examples below assume `discrawl` is on `PATH`. If you built from source without installing it, replace `discrawl` with `./bin/discrawl`.
 
 ## Quick Start
 
 Reuse an existing OpenClaw Discord bot config:
 
 ```bash
-bin/discrawl init --from-openclaw ~/.openclaw/openclaw.json
-bin/discrawl doctor
-bin/discrawl sync --full
-bin/discrawl search "panic: nil pointer"
-bin/discrawl tail
+discrawl init --from-openclaw ~/.openclaw/openclaw.json
+discrawl doctor
+discrawl sync --full
+discrawl search "panic: nil pointer"
+discrawl tail
 ```
 
 Env-only setup:
 
 ```bash
 export DISCORD_BOT_TOKEN="..."
-bin/discrawl doctor
-bin/discrawl init
-bin/discrawl sync --full
+discrawl doctor
+discrawl init
+discrawl sync --full
 ```
 
 `init` discovers accessible guilds and writes `~/.discrawl/config.toml`. If exactly one guild is available, that guild becomes the default automatically.
@@ -132,10 +134,10 @@ bin/discrawl sync --full
 Creates the local config and discovers accessible guilds.
 
 ```bash
-bin/discrawl init
-bin/discrawl init --from-openclaw ~/.openclaw/openclaw.json
-bin/discrawl init --guild 123456789012345678
-bin/discrawl init --db ~/data/discrawl.db
+discrawl init
+discrawl init --from-openclaw ~/.openclaw/openclaw.json
+discrawl init --guild 123456789012345678
+discrawl init --db ~/data/discrawl.db
 ```
 
 ### `sync`
@@ -143,10 +145,10 @@ bin/discrawl init --db ~/data/discrawl.db
 Backfills guild state into SQLite.
 
 ```bash
-bin/discrawl sync --full
-bin/discrawl sync --guild 123456789012345678
-bin/discrawl sync --guilds 123,456 --concurrency 8
-bin/discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z
+discrawl sync --full
+discrawl sync --guild 123456789012345678
+discrawl sync --guilds 123,456 --concurrency 8
+discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z
 ```
 
 `sync` already uses parallel channel workers. `--concurrency` overrides the default, and the default is auto-sized from `GOMAXPROCS` with a floor of `8` and a cap of `32`.
@@ -162,9 +164,9 @@ If a guild already has a local member snapshot, routine syncs reuse it and skip 
 Runs the live Gateway tail and periodic repair loop.
 
 ```bash
-bin/discrawl tail
-bin/discrawl tail --guild 123456789012345678
-bin/discrawl tail --repair-every 30m
+discrawl tail
+discrawl tail --guild 123456789012345678
+discrawl tail --repair-every 30m
 ```
 
 ### `search`
@@ -172,11 +174,11 @@ bin/discrawl tail --repair-every 30m
 Runs FTS search over archived messages.
 
 ```bash
-bin/discrawl search "panic: nil pointer"
-bin/discrawl search --guild 123456789012345678 "payment failed"
-bin/discrawl search --channel billing --author steipete --limit 50 "invoice"
-bin/discrawl search --include-empty "GitHub"
-bin/discrawl --json search "websocket closed"
+discrawl search "panic: nil pointer"
+discrawl search --guild 123456789012345678 "payment failed"
+discrawl search --channel billing --author steipete --limit 50 "invoice"
+discrawl search --include-empty "GitHub"
+discrawl --json search "websocket closed"
 ```
 
 By default, `search` skips rows with no searchable content. Attachment text, attachment filenames, embeds, and replies still count as content. Use `--include-empty` to opt back in.
@@ -186,13 +188,13 @@ By default, `search` skips rows with no searchable content. Attachment text, att
 Lists exact message slices by channel, author, and time range.
 
 ```bash
-bin/discrawl messages --channel maintainers --days 7 --all
-bin/discrawl messages --channel maintainers --hours 6 --all
-bin/discrawl messages --channel "#maintainers" --since 2026-03-01T00:00:00Z
-bin/discrawl messages --channel 1456744319972282449 --author steipete --limit 50
-bin/discrawl messages --channel maintainers --last 100 --sync
-bin/discrawl messages --channel maintainers --days 7 --all --include-empty
-bin/discrawl --json messages --channel maintainers --days 3
+discrawl messages --channel maintainers --days 7 --all
+discrawl messages --channel maintainers --hours 6 --all
+discrawl messages --channel "#maintainers" --since 2026-03-01T00:00:00Z
+discrawl messages --channel 1456744319972282449 --author steipete --limit 50
+discrawl messages --channel maintainers --last 100 --sync
+discrawl messages --channel maintainers --days 7 --all --include-empty
+discrawl --json messages --channel maintainers --days 3
 ```
 
 Notes:
@@ -211,10 +213,10 @@ Notes:
 Lists structured user and role mentions.
 
 ```bash
-bin/discrawl mentions --channel maintainers --days 7
-bin/discrawl mentions --target steipete --type user --limit 50
-bin/discrawl mentions --target 1456406468898197625
-bin/discrawl --json mentions --type role --days 1
+discrawl mentions --channel maintainers --days 7
+discrawl mentions --target steipete --type user --limit 50
+discrawl mentions --target 1456406468898197625
+discrawl --json mentions --type role --days 1
 ```
 
 Notes:
@@ -228,19 +230,19 @@ Notes:
 Runs read-only SQL against the local database.
 
 ```bash
-bin/discrawl sql 'select count(*) as messages from messages'
-echo 'select guild_id, count(*) from messages group by guild_id' | bin/discrawl sql -
+discrawl sql 'select count(*) as messages from messages'
+echo 'select guild_id, count(*) from messages group by guild_id' | discrawl sql -
 ```
 
 ### `members`
 
 ```bash
-bin/discrawl members list
-bin/discrawl members show 123456789012345678
-bin/discrawl members show --messages 10 steipete
-bin/discrawl members search "peter"
-bin/discrawl members search "github"
-bin/discrawl members search "https://github.com/steipete"
+discrawl members list
+discrawl members show 123456789012345678
+discrawl members show --messages 10 steipete
+discrawl members search "peter"
+discrawl members search "github"
+discrawl members search "https://github.com/steipete"
 ```
 
 Notes:
@@ -253,11 +255,11 @@ Notes:
 Typical workflow:
 
 ```bash
-bin/discrawl sync --full
-bin/discrawl members search "design engineer"
-bin/discrawl members search "github"
-bin/discrawl members show --messages 25 steipete
-bin/discrawl messages --author steipete --days 30 --all
+discrawl sync --full
+discrawl members search "design engineer"
+discrawl members search "github"
+discrawl members show --messages 25 steipete
+discrawl messages --author steipete --days 30 --all
 ```
 
 Typical `members show` output:
@@ -289,8 +291,8 @@ Searchable member data comes from:
 ### `channels`
 
 ```bash
-bin/discrawl channels list
-bin/discrawl channels show 123456789012345678
+discrawl channels list
+discrawl channels show 123456789012345678
 ```
 
 ### `status`
@@ -298,7 +300,7 @@ bin/discrawl channels show 123456789012345678
 Shows local archive status.
 
 ```bash
-bin/discrawl status
+discrawl status
 ```
 
 ### `doctor`
@@ -306,7 +308,7 @@ bin/discrawl status
 Checks config, auth, DB, and FTS wiring.
 
 ```bash
-bin/discrawl doctor
+discrawl doctor
 ```
 
 ## Configuration
@@ -362,8 +364,8 @@ If enabled, embeddings are intended to enrich recall in background batches, not 
 
 ```bash
 export OPENAI_API_KEY="..."
-bin/discrawl init --with-embeddings
-bin/discrawl sync --with-embeddings
+discrawl init --with-embeddings
+discrawl sync --with-embeddings
 ```
 
 ## Data Stored Locally
