@@ -2,16 +2,17 @@
 
 All notable changes to `discrawl` will be documented in this file.
 
-## 0.2.0 - Unreleased
+## 0.2.0 - 2026-03-26
 
-- `sync --full` now auto-batches incomplete message channels from the local archive instead of stalling on large forum/thread catalogs
-- offline member-profile search via `member_fts`
-- `members search` now matches archived profile fields in addition to names
-- `members show` now accepts ids or queries and shows recent messages plus message stats when uniquely resolved
-- profile extraction surfaces stored fields like `bio`, `website`, `x`, `github`, and other archived URLs when present
-- `messages --sync` now blocks on a targeted pre-query refresh for channel/guild scope
+- much faster `sync --full` behavior on large archives: incomplete backfills are auto-batched, active-thread discovery is more precise, and steady-state refreshes avoid re-scanning every archived thread once history is already complete
+- `sync --since` now reliably honors the cutoff during bootstrap and full-history backfill, while still allowing a later `sync --full` without `--since` to continue older history
+- full-sync progress is more resilient: slow member crawls no longer hold message sync hostage, and stale unavailable-channel markers are cleared so recovered channels can sync again
+- offline member-profile search is now much richer: `members search` matches archived profile fields in addition to names
+- `members show` now accepts either Discord IDs or queries and can include recent messages plus message stats for the resolved member
+- archived profile extraction now surfaces stored fields like `bio`, `pronouns`, `location`, `website`, `x`, `github`, and discovered URLs when present
+- `messages --sync` can do a blocking pre-query refresh for the matching channel or guild scope before reading the local archive
 - `messages --hours` adds recent-hour slices without manual RFC3339 timestamps
-- `messages --last` returns the newest matching rows while preserving oldest-to-newest output order
+- `messages --last` returns the newest matching rows while still printing them oldest-to-newest
 
 ## 0.1.0 - 2026-03-08
 
