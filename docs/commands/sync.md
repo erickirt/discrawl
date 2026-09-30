@@ -90,6 +90,93 @@ discrawl sync --with-media
 - Interrupted recovery resumes from its own saved page checkpoint on the next unwindowed sync, including after cancellation or process termination. Messages ingested in the meantime do not mark the older history complete.
 - Failed recovery leaves partial history resumable. After cancellation, restoring a still-empty channel's completion marker uses the existing five-second failure-cleanup budget.
 
+## Re-fetching Components V2 messages archived with empty text
+
+Discrawl versions before Components V2 support stored messages sent with the `IS_COMPONENTS_V2` flag (`32768`), such as app-posted GitHub cards, without their component tree or text. This affects both bot sync and Desktop cache imports. Those rows cannot be rebuilt locally, and routine runs don't re-read them: `sync`, `--all-channels`, `--full` and `--channels` only request messages after each channel's stored cursor, and `wiretap` skips cache files that haven't changed. Repair them with the fixed binary:
+
+### Prepare
+
+0. Back up the archive. `sqlite3 .backup` takes a consistent copy even while a writer is running:
+
+   ```bash
+   DB="$(discrawl status | sed -n 's/^db=//p')"
+   sqlite3 "$DB" ".backup '$DB.before-components-v2'"
+   ```
+
+   To roll back later, stop every `sync`/`tail`, then run `cp "$DB.before-components-v2" "$DB" && rm -f "$DB-wal" "$DB-shm"`.
+
+1. Stop every `sync`, `tail` and scheduled sync that writes to this archive.
+
+### Bot-synced rows
+
+2. List the affected channels, their broken-row counts and oldest broken message ids, and save the channel ids:
+
+   ```bash
+   BROKEN="deleted_at is null and json_extract(raw_json, '\$.flags') & 32768 and json_type(raw_json, '\$.components') is null"
+   sqlite3 -header "$DB" "select channel_id, count(*) as broken, min(cast(id as integer)) as oldest_id from messages where $BROKEN group by channel_id"
+   CHANNELS="$(sqlite3 "$DB" "select group_concat(distinct channel_id) from messages where $BROKEN")"
+   ```
+
+3. Rewind each affected channel's `latest_message_id` cursor to just before its oldest broken message:
+
+   ```bash
+   sqlite3 "$DB" "
+     update sync_state
+        set cursor = (select cast(min(cast(id as integer)) - 1 as text) from messages
+                       where $BROKEN and sync_state.scope = 'channel:' || channel_id || ':latest_message_id')
+      where scope in (select distinct 'channel:' || channel_id || ':latest_message_id' from messages where $BROKEN)"
+   ```
+
+4. Re-fetch those channels. The crawl moves forward from the rewound cursor and rewrites every message it receives, including `raw_json`, `normalized_content` and the search indexes. When it finishes, the cursor is back at the channel head:
+
+   ```bash
+   discrawl sync --source discord --channels "$CHANNELS"
+   ```
+
+5. Verify. The broken-row count should be `0`, and a search for the text of a known card should find it:
+
+   ```bash
+   sqlite3 "$DB" "select count(*) from messages where $BROKEN"
+   discrawl search "<text from a known card>"
+   ```
+
+   Any rows that remain are messages Discord no longer returns, for example because they were deleted. List them with the step 2 query.
+
+### Desktop-imported rows
+
+Desktop imports keep a sanitized `raw_json` without flags or components, so broken Desktop rows can't be counted exactly. The closest check is Desktop rows that have no text and no attachments. It also matches messages that are genuinely empty, such as sticker-only messages.
+
+6. Count the candidates:
+
+   ```bash
+   DESKTOP="deleted_at is null and json_extract(raw_json, '\$.source') = 'discord_desktop' and trim(coalesce(normalized_content, '')) = '' and has_attachments = 0"
+   sqlite3 "$DB" "select count(*) from messages where $DESKTOP"
+   ```
+
+7. Clear the Desktop file index so the next import rescans every cache file instead of skipping unchanged ones, then re-import:
+
+   ```bash
+   sqlite3 "$DB" "delete from sync_state where scope like 'wiretap:file_index:%'"
+   discrawl wiretap
+   ```
+
+8. Verify. The candidate count should drop by the number of recovered messages, and a search for the text of a known card should find it:
+
+   ```bash
+   sqlite3 "$DB" "select count(*) from messages where $DESKTOP"
+   discrawl search "<text from a known card>"
+   ```
+
+This only recovers messages that Discord Desktop still has cached. If a remaining candidate is in a guild channel the bot can read, repeat steps 2-5 with `BROKEN="$DESKTOP and guild_id <> '@me'"`. Keep only those channels in `CHANNELS`, because a targeted sync fails on channels the bot cannot read. The rewind and `--channels` sync then fetch those messages through the bot.
+
+### Publish
+
+9. Publish the repaired archive:
+
+   ```bash
+   discrawl publish --push
+   ```
+
 ## See also
 
 - [Sync sources](../guides/sync-sources.html)
